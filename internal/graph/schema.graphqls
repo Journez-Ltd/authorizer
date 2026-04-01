@@ -405,6 +405,15 @@ input MobileLoginRequest {
   state: String
 }
 
+input SocialLoginRequest {
+  provider: String!
+  id_token: String!
+  given_name: String
+  family_name: String
+  roles: [String!]
+  scope: [String!]
+}
+
 input VerifyEmailRequest {
   token: String!
   # state is used for authorization code grant flow
@@ -615,6 +624,7 @@ type Mutation {
   login(params: LoginRequest!): AuthResponse!
   # Deprecated from v1.2.0
   mobile_login(params: MobileLoginRequest!): AuthResponse!
+  social_login(params: SocialLoginRequest!): AuthResponse!
   magic_link_login(params: MagicLinkLoginRequest!): Response!
   logout: Response!
   update_profile(params: UpdateProfileRequest!): Response!

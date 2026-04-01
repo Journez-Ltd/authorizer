@@ -133,6 +133,9 @@ type Provider interface {
 	// SignUp is the method to SignUp.
 	// Permissions: none
 	SignUp(ctx context.Context, params *model.SignUpRequest) (*model.AuthResponse, error)
+	// SocialLogin handles login/signup via client-side social provider id_token.
+	// Permissions: none
+	SocialLogin(ctx context.Context, params *model.SocialLoginRequest) (*model.AuthResponse, error)
 	// TestEndpoint is the method to test endpoint.
 	// Permissions: authorizer:admin
 	TestEndpoint(ctx context.Context, params *model.TestEndpointRequest) (*model.TestEndpointResponse, error)

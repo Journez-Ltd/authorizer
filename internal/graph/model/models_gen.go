@@ -327,6 +327,15 @@ type SignUpRequest struct {
 	AppData                  map[string]any `json:"app_data,omitempty"`
 }
 
+type SocialLoginRequest struct {
+	Provider   string   `json:"provider"`
+	IDToken    string   `json:"id_token"`
+	GivenName  *string  `json:"given_name,omitempty"`
+	FamilyName *string  `json:"family_name,omitempty"`
+	Roles      []string `json:"roles,omitempty"`
+	Scope      []string `json:"scope,omitempty"`
+}
+
 type TestEndpointRequest struct {
 	Endpoint         string         `json:"endpoint"`
 	EventName        string         `json:"event_name"`
