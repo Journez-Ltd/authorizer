@@ -10,7 +10,18 @@
       "Bash(docker:*)",
       "Bash(go version)",
       "Bash(go mod:*)",
-      "Bash(go clean:*)"
+      "Bash(go clean:*)",
+      "WebFetch(domain:help.airbridge.io)",
+      "Bash(grep -E \"\\\\.\\(go|ts|tsx\\)$\")",
+      "Bash(grep:*)",
+      "Bash(make generate-graphql:*)",
+      "Bash(go vet:*)"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "github",
+    "context7",
+    "postman",
+    "dart-mcp-server"
+  ]
 }
