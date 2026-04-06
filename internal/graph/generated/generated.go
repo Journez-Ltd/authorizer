@@ -219,6 +219,7 @@ type ComplexityRoot struct {
 		Revoke              func(childComplexity int, params model.OAuthRevokeRequest) int
 		RevokeAccess        func(childComplexity int, param model.UpdateAccessRequest) int
 		Signup              func(childComplexity int, params model.SignUpRequest) int
+		SocialLogin         func(childComplexity int, params model.SocialLoginRequest) int
 		TestEndpoint        func(childComplexity int, params model.TestEndpointRequest) int
 		UpdateEmailTemplate func(childComplexity int, params model.UpdateEmailTemplateRequest) int
 		UpdateEnv           func(childComplexity int, params model.UpdateEnvRequest) int
@@ -354,6 +355,7 @@ type MutationResolver interface {
 	MobileSignup(ctx context.Context, params *model.MobileSignUpRequest) (*model.AuthResponse, error)
 	Login(ctx context.Context, params model.LoginRequest) (*model.AuthResponse, error)
 	MobileLogin(ctx context.Context, params model.MobileLoginRequest) (*model.AuthResponse, error)
+	SocialLogin(ctx context.Context, params model.SocialLoginRequest) (*model.AuthResponse, error)
 	MagicLinkLogin(ctx context.Context, params model.MagicLinkLoginRequest) (*model.Response, error)
 	Logout(ctx context.Context) (*model.Response, error)
 	UpdateProfile(ctx context.Context, params model.UpdateProfileRequest) (*model.Response, error)
@@ -1539,6 +1541,18 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 
 		return e.complexity.Mutation.Signup(childComplexity, args["params"].(model.SignUpRequest)), true
 
+	case "Mutation.social_login":
+		if e.complexity.Mutation.SocialLogin == nil {
+			break
+		}
+
+		args, err := ec.field_Mutation_social_login_args(ctx, rawArgs)
+		if err != nil {
+			return 0, false
+		}
+
+		return e.complexity.Mutation.SocialLogin(childComplexity, args["params"].(model.SocialLoginRequest)), true
+
 	case "Mutation._test_endpoint":
 		if e.complexity.Mutation.TestEndpoint == nil {
 			break
@@ -2255,6 +2269,7 @@ func (e *executableSchema) Exec(ctx context.Context) graphql.ResponseHandler {
 		ec.unmarshalInputResetPasswordRequest,
 		ec.unmarshalInputSessionQueryRequest,
 		ec.unmarshalInputSignUpRequest,
+		ec.unmarshalInputSocialLoginRequest,
 		ec.unmarshalInputTestEndpointRequest,
 		ec.unmarshalInputUpdateAccessRequest,
 		ec.unmarshalInputUpdateEmailTemplateRequest,
@@ -2771,6 +2786,15 @@ input MobileLoginRequest {
   state: String
 }
 
+input SocialLoginRequest {
+  provider: String!
+  id_token: String!
+  given_name: String
+  family_name: String
+  roles: [String!]
+  scope: [String!]
+}
+
 input VerifyEmailRequest {
   token: String!
   # state is used for authorization code grant flow
@@ -2981,6 +3005,7 @@ type Mutation {
   login(params: LoginRequest!): AuthResponse!
   # Deprecated from v1.2.0
   mobile_login(params: MobileLoginRequest!): AuthResponse!
+  social_login(params: SocialLoginRequest!): AuthResponse!
   magic_link_login(params: MagicLinkLoginRequest!): Response!
   logout: Response!
   update_profile(params: UpdateProfileRequest!): Response!
@@ -3766,6 +3791,34 @@ func (ec *executionContext) field_Mutation_signup_argsParams(
 	}
 
 	var zeroVal model.SignUpRequest
+	return zeroVal, nil
+}
+
+func (ec *executionContext) field_Mutation_social_login_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
+	var err error
+	args := map[string]any{}
+	arg0, err := ec.field_Mutation_social_login_argsParams(ctx, rawArgs)
+	if err != nil {
+		return nil, err
+	}
+	args["params"] = arg0
+	return args, nil
+}
+func (ec *executionContext) field_Mutation_social_login_argsParams(
+	ctx context.Context,
+	rawArgs map[string]any,
+) (model.SocialLoginRequest, error) {
+	if _, ok := rawArgs["params"]; !ok {
+		var zeroVal model.SocialLoginRequest
+		return zeroVal, nil
+	}
+
+	ctx = graphql.WithPathContext(ctx, graphql.NewPathWithField("params"))
+	if tmp, ok := rawArgs["params"]; ok {
+		return ec.unmarshalNSocialLoginRequest2githubᚗcomᚋauthorizerdevᚋauthorizerᚋinternalᚋgraphᚋmodelᚐSocialLoginRequest(ctx, tmp)
+	}
+
+	var zeroVal model.SocialLoginRequest
 	return zeroVal, nil
 }
 
@@ -9820,6 +9873,87 @@ func (ec *executionContext) fieldContext_Mutation_mobile_login(ctx context.Conte
 	}()
 	ctx = graphql.WithFieldContext(ctx, fc)
 	if fc.Args, err = ec.field_Mutation_mobile_login_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
+		ec.Error(ctx, err)
+		return fc, err
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _Mutation_social_login(ctx context.Context, field graphql.CollectedField) (ret graphql.Marshaler) {
+	fc, err := ec.fieldContext_Mutation_social_login(ctx, field)
+	if err != nil {
+		return graphql.Null
+	}
+	ctx = graphql.WithFieldContext(ctx, fc)
+	defer func() {
+		if r := recover(); r != nil {
+			ec.Error(ctx, ec.Recover(ctx, r))
+			ret = graphql.Null
+		}
+	}()
+	resTmp, err := ec.ResolverMiddleware(ctx, func(rctx context.Context) (any, error) {
+		ctx = rctx // use context from middleware stack in children
+		return ec.resolvers.Mutation().SocialLogin(rctx, fc.Args["params"].(model.SocialLoginRequest))
+	})
+	if err != nil {
+		ec.Error(ctx, err)
+		return graphql.Null
+	}
+	if resTmp == nil {
+		if !graphql.HasFieldError(ctx, fc) {
+			ec.Errorf(ctx, "must not be null")
+		}
+		return graphql.Null
+	}
+	res := resTmp.(*model.AuthResponse)
+	fc.Result = res
+	return ec.marshalNAuthResponse2ᚖgithubᚗcomᚋauthorizerdevᚋauthorizerᚋinternalᚋgraphᚋmodelᚐAuthResponse(ctx, field.Selections, res)
+}
+
+func (ec *executionContext) fieldContext_Mutation_social_login(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "Mutation",
+		Field:      field,
+		IsMethod:   true,
+		IsResolver: true,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			switch field.Name {
+			case "message":
+				return ec.fieldContext_AuthResponse_message(ctx, field)
+			case "should_show_email_otp_screen":
+				return ec.fieldContext_AuthResponse_should_show_email_otp_screen(ctx, field)
+			case "should_show_mobile_otp_screen":
+				return ec.fieldContext_AuthResponse_should_show_mobile_otp_screen(ctx, field)
+			case "should_show_totp_screen":
+				return ec.fieldContext_AuthResponse_should_show_totp_screen(ctx, field)
+			case "access_token":
+				return ec.fieldContext_AuthResponse_access_token(ctx, field)
+			case "id_token":
+				return ec.fieldContext_AuthResponse_id_token(ctx, field)
+			case "refresh_token":
+				return ec.fieldContext_AuthResponse_refresh_token(ctx, field)
+			case "expires_in":
+				return ec.fieldContext_AuthResponse_expires_in(ctx, field)
+			case "user":
+				return ec.fieldContext_AuthResponse_user(ctx, field)
+			case "authenticator_scanner_image":
+				return ec.fieldContext_AuthResponse_authenticator_scanner_image(ctx, field)
+			case "authenticator_secret":
+				return ec.fieldContext_AuthResponse_authenticator_secret(ctx, field)
+			case "authenticator_recovery_codes":
+				return ec.fieldContext_AuthResponse_authenticator_recovery_codes(ctx, field)
+			}
+			return nil, fmt.Errorf("no field named %q was found under type AuthResponse", field.Name)
+		},
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = ec.Recover(ctx, r)
+			ec.Error(ctx, err)
+		}
+	}()
+	ctx = graphql.WithFieldContext(ctx, fc)
+	if fc.Args, err = ec.field_Mutation_social_login_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
 		ec.Error(ctx, err)
 		return fc, err
 	}
@@ -18635,6 +18769,68 @@ func (ec *executionContext) unmarshalInputSignUpRequest(ctx context.Context, obj
 	return it, nil
 }
 
+func (ec *executionContext) unmarshalInputSocialLoginRequest(ctx context.Context, obj any) (model.SocialLoginRequest, error) {
+	var it model.SocialLoginRequest
+	asMap := map[string]any{}
+	for k, v := range obj.(map[string]any) {
+		asMap[k] = v
+	}
+
+	fieldsInOrder := [...]string{"provider", "id_token", "given_name", "family_name", "roles", "scope"}
+	for _, k := range fieldsInOrder {
+		v, ok := asMap[k]
+		if !ok {
+			continue
+		}
+		switch k {
+		case "provider":
+			ctx := graphql.WithPathContext(ctx, graphql.NewPathWithField("provider"))
+			data, err := ec.unmarshalNString2string(ctx, v)
+			if err != nil {
+				return it, err
+			}
+			it.Provider = data
+		case "id_token":
+			ctx := graphql.WithPathContext(ctx, graphql.NewPathWithField("id_token"))
+			data, err := ec.unmarshalNString2string(ctx, v)
+			if err != nil {
+				return it, err
+			}
+			it.IDToken = data
+		case "given_name":
+			ctx := graphql.WithPathContext(ctx, graphql.NewPathWithField("given_name"))
+			data, err := ec.unmarshalOString2ᚖstring(ctx, v)
+			if err != nil {
+				return it, err
+			}
+			it.GivenName = data
+		case "family_name":
+			ctx := graphql.WithPathContext(ctx, graphql.NewPathWithField("family_name"))
+			data, err := ec.unmarshalOString2ᚖstring(ctx, v)
+			if err != nil {
+				return it, err
+			}
+			it.FamilyName = data
+		case "roles":
+			ctx := graphql.WithPathContext(ctx, graphql.NewPathWithField("roles"))
+			data, err := ec.unmarshalOString2ᚕstringᚄ(ctx, v)
+			if err != nil {
+				return it, err
+			}
+			it.Roles = data
+		case "scope":
+			ctx := graphql.WithPathContext(ctx, graphql.NewPathWithField("scope"))
+			data, err := ec.unmarshalOString2ᚕstringᚄ(ctx, v)
+			if err != nil {
+				return it, err
+			}
+			it.Scope = data
+		}
+	}
+
+	return it, nil
+}
+
 func (ec *executionContext) unmarshalInputTestEndpointRequest(ctx context.Context, obj any) (model.TestEndpointRequest, error) {
 	var it model.TestEndpointRequest
 	asMap := map[string]any{}
@@ -20464,6 +20660,13 @@ func (ec *executionContext) _Mutation(ctx context.Context, sel ast.SelectionSet)
 		case "mobile_login":
 			out.Values[i] = ec.OperationContext.RootResolverMiddleware(innerCtx, func(ctx context.Context) (res graphql.Marshaler) {
 				return ec._Mutation_mobile_login(ctx, field)
+			})
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "social_login":
+			out.Values[i] = ec.OperationContext.RootResolverMiddleware(innerCtx, func(ctx context.Context) (res graphql.Marshaler) {
+				return ec._Mutation_social_login(ctx, field)
 			})
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
@@ -22331,6 +22534,11 @@ func (ec *executionContext) marshalNResponse2ᚖgithubᚗcomᚋauthorizerdevᚋa
 
 func (ec *executionContext) unmarshalNSignUpRequest2githubᚗcomᚋauthorizerdevᚋauthorizerᚋinternalᚋgraphᚋmodelᚐSignUpRequest(ctx context.Context, v any) (model.SignUpRequest, error) {
 	res, err := ec.unmarshalInputSignUpRequest(ctx, v)
+	return res, graphql.ErrorOnPath(ctx, err)
+}
+
+func (ec *executionContext) unmarshalNSocialLoginRequest2githubᚗcomᚋauthorizerdevᚋauthorizerᚋinternalᚋgraphᚋmodelᚐSocialLoginRequest(ctx context.Context, v any) (model.SocialLoginRequest, error) {
+	res, err := ec.unmarshalInputSocialLoginRequest(ctx, v)
 	return res, graphql.ErrorOnPath(ctx, err)
 }
 

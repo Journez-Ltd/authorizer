@@ -32,6 +32,11 @@ func (r *mutationResolver) MobileLogin(ctx context.Context, params model.MobileL
 	return nil, fmt.Errorf("deprecated, use login with mobile phone_number")
 }
 
+// SocialLogin is the resolver for the social_login field.
+func (r *mutationResolver) SocialLogin(ctx context.Context, params model.SocialLoginRequest) (*model.AuthResponse, error) {
+	return r.GraphQLProvider.SocialLogin(ctx, &params)
+}
+
 // MagicLinkLogin is the resolver for the magic_link_login field.
 func (r *mutationResolver) MagicLinkLogin(ctx context.Context, params model.MagicLinkLoginRequest) (*model.Response, error) {
 	return r.GraphQLProvider.MagicLinkLogin(ctx, &params)
