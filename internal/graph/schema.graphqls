@@ -246,6 +246,25 @@ type WebhookLogs {
   webhook_logs: [WebhookLog!]!
 }
 
+type AuditLog {
+  id: ID!
+  actor_id: String
+  actor_type: String
+  actor_email: String
+  action: String
+  resource_type: String
+  resource_id: String
+  ip_address: String
+  user_agent: String
+  metadata: String
+  created_at: Int64
+}
+
+type AuditLogs {
+  pagination: Pagination!
+  audit_logs: [AuditLog!]!
+}
+
 type EmailTemplate {
   id: ID!
   event_name: String!
@@ -487,6 +506,10 @@ input MagicLinkLoginRequest {
 input SessionQueryRequest {
   roles: [String!]
   scope: [String!]
+  # state is used for authorization code grant flow
+  # when a session already exists and the login UI auto-detects it,
+  # passing state ensures the authorization code state is properly stored
+  state: String
 }
 
 input PaginationRequest {
@@ -529,6 +552,16 @@ input GenerateJWTKeysRequest {
 input ListWebhookLogRequest {
   pagination: PaginationRequest
   webhook_id: String
+}
+
+input ListAuditLogRequest {
+  pagination: PaginationRequest
+  action: String
+  actor_id: String
+  resource_type: String
+  resource_id: String
+  from_timestamp: Int64
+  to_timestamp: Int64
 }
 
 input AddWebhookRequest {
@@ -666,4 +699,5 @@ type Query {
   _webhooks(params: PaginatedRequest): Webhooks!
   _webhook_logs(params: ListWebhookLogRequest): WebhookLogs!
   _email_templates(params: PaginatedRequest): EmailTemplates!
+  _audit_logs(params: ListAuditLogRequest): AuditLogs!
 }

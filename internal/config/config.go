@@ -4,6 +4,10 @@ package config
 type Config struct {
 	// Env is the environment of the authorizer instance
 	Env string
+	// SkipTestEndpointSSRFValidation relaxes SSRF checks for the admin TestEndpoint GraphQL
+	// mutation (e.g. to hit localhost in tests). Must remain false in production; integration
+	// tests enable it together with Env=test.
+	SkipTestEndpointSSRFValidation bool
 	// OrganizationLogo is the logo of the organization
 	OrganizationLogo string
 	// OrganizationName is the name of the organization
@@ -19,6 +23,25 @@ type Config struct {
 	EnablePlayground bool
 	// EnableGraphQLIntrospection is the flag to enable GraphQL introspection
 	EnableGraphQLIntrospection bool
+	// EnableHSTS opts in to the Strict-Transport-Security response header.
+	// Off by default because operators not behind TLS would lock themselves
+	// out for a year. Enable in production behind TLS.
+	EnableHSTS bool
+	// DisableCSP turns off the default Content-Security-Policy header.
+	// Off by default — CSP is on by default. Provided as an escape hatch
+	// for dashboards that load assets in ways the default policy blocks.
+	DisableCSP bool
+	// GraphQLMaxComplexity caps the total complexity score of a single GraphQL
+	// operation. Operations exceeding this limit are rejected before execution.
+	GraphQLMaxComplexity int
+	// GraphQLMaxDepth caps the maximum nesting depth of a GraphQL selection set.
+	GraphQLMaxDepth int
+	// GraphQLMaxAliases caps the total number of aliased fields per operation.
+	// Defends against alias-amplification denial-of-service attacks.
+	GraphQLMaxAliases int
+	// GraphQLMaxBodyBytes caps the size of the request body accepted by the
+	// GraphQL endpoint to prevent oversized-payload denial of service.
+	GraphQLMaxBodyBytes int64
 
 	// Database Configurations
 	// DatabaseType is the type of database to use
@@ -143,8 +166,30 @@ type Config struct {
 	JWTPublicKey string
 	// JWTPrivateKey is the private key for the JWT
 	JWTPrivateKey string
+	// JWTSecondaryType is the algorithm of an optional secondary JWT
+	// key used for manual key rotation. When set along with the other
+	// JWT secondary fields, the JWKS endpoint will publish both keys
+	// and token validation will accept tokens signed with either key.
+	// New tokens are always signed with the primary key (JWTType).
+	// Leave empty to disable multi-key mode (default).
+	JWTSecondaryType string
+	// JWTSecondarySecret is the secret for the secondary JWT key.
+	// Used only when JWTSecondaryType is an HMAC algorithm. HMAC keys
+	// are never exposed via the JWKS endpoint.
+	JWTSecondarySecret string
+	// JWTSecondaryPublicKey is the public key for the secondary JWT
+	// key. Used when JWTSecondaryType is RSA or ECDSA.
+	JWTSecondaryPublicKey string
+	// JWTSecondaryPrivateKey is the private key for the secondary JWT
+	// key. Currently unused at the signing stage (the primary key is
+	// always used to sign); kept for symmetry and for future
+	// primary/secondary swap automation.
+	JWTSecondaryPrivateKey string
 	// JWTRoleClaim is the role claim for the JWT
 	JWTRoleClaim string
+	// RefreshTokenExpiresIn is the refresh token lifetime in seconds.
+	// Defaults to 30 days (2592000 seconds) when zero or unset.
+	RefreshTokenExpiresIn int64
 	// CustomAccessTokenScript is the custom access token script
 	CustomAccessTokenScript string
 
@@ -243,8 +288,32 @@ type Config struct {
 
 	// IsAppCookieSecure is the flag to set secure(http only) cookie
 	AppCookieSecure bool
+	// AppCookieSameSite controls the SameSite attribute for session cookies.
+	// Valid values: "none" (default), "lax", "strict".
+	// "none" preserves backward compatibility for cross-domain SDK setups
+	// (requires AppCookieSecure=true). Use "lax" or "strict" for same-origin deployments.
+	AppCookieSameSite string
 	// IsAdminCookieSecure is the flag to set secure(http only) cookie
 	AdminCookieSecure bool
 	// DisableAdminHeaderAuth is the flag to disable admin authentication via header
 	DisableAdminHeaderAuth bool
+	// Rate Limiting
+	// RateLimitRPS is the maximum requests per second per IP
+	RateLimitRPS int
+	// RateLimitBurst is the maximum burst size per IP
+	RateLimitBurst int
+	// RateLimitFailClosed rejects requests when the rate limit backend errors (default: fail-open).
+	RateLimitFailClosed bool
+	// TrustedProxies is the list of CIDRs allowed to set X-Forwarded-For
+	// and similar proxy headers. Empty (the default) means no proxies are
+	// trusted and gin will use RemoteAddr directly. Operators behind a
+	// reverse proxy MUST set this explicitly or rate limiting and audit
+	// logs will key on the proxy IP, not the real client IP.
+	TrustedProxies []string
+
+	// BackchannelLogoutURI is the URL to which the server POSTs a
+	// signed logout_token when a user logs out successfully. When
+	// empty (default), back-channel logout notifications are disabled.
+	// See OIDC Back-Channel Logout 1.0 §2.5 for the protocol.
+	BackchannelLogoutURI string
 }

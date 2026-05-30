@@ -43,7 +43,7 @@ func (h *httpProvider) AppHandler() gin.HandlerFunc {
 			redirectURI = hostname + "/app"
 		} else {
 			// validate redirect url with allowed origins
-			if !validators.IsValidOrigin(redirectURI, h.Config.AllowedOrigins) {
+			if !validators.IsValidRedirectURI(redirectURI, h.Config.AllowedOrigins, hostname) {
 				log.Debug().Msg("Invalid redirect url")
 				c.JSON(400, gin.H{"error": "invalid redirect url"})
 				return
@@ -68,6 +68,7 @@ func (h *httpProvider) AppHandler() gin.HandlerFunc {
 				"state":            state,
 				"organizationName": orgName,
 				"organizationLogo": orgLogo,
+				"clientId":         h.Config.ClientID,
 			},
 		})
 	}

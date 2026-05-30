@@ -8,8 +8,10 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
 	"github.com/authorizerdev/authorizer/internal/constants"
 	"github.com/authorizerdev/authorizer/internal/cookie"
+	"github.com/authorizerdev/authorizer/internal/crypto"
 	"github.com/authorizerdev/authorizer/internal/graph/model"
 	"github.com/authorizerdev/authorizer/internal/parsers"
 	"github.com/authorizerdev/authorizer/internal/refs"
@@ -31,7 +33,7 @@ func (g *graphqlProvider) VerifyOTP(ctx context.Context, params *model.VerifyOTP
 	mfaSession, err := cookie.GetMfaSession(gc)
 	if err != nil {
 		log.Debug().Err(err).Msg("Failed to get mfa session")
-		return nil, fmt.Errorf(`invalid session: %s`, err.Error())
+		return nil, fmt.Errorf(`invalid session`)
 	}
 
 	email := strings.TrimSpace(refs.StringValue(params.Email))
@@ -58,12 +60,12 @@ func (g *graphqlProvider) VerifyOTP(ctx context.Context, params *model.VerifyOTP
 	}
 	if user == nil || err != nil {
 		log.Debug().Err(err).Msg("User not found")
-		return nil, fmt.Errorf(`user not found`)
+		return nil, fmt.Errorf("invalid verification request")
 	}
 
 	if user.RevokedTimestamp != nil {
 		log.Debug().Msg("User access has been revoked")
-		return nil, fmt.Errorf("user access has been revoked")
+		return nil, fmt.Errorf("invalid verification request")
 	}
 
 	// Verify OTP based on TOPT or OTP
@@ -100,11 +102,15 @@ func (g *graphqlProvider) VerifyOTP(ctx context.Context, params *model.VerifyOTP
 				log.Debug().Err(err).Msg("Failed to get otp request for phone number")
 			}
 		}
-		if otp == nil && err != nil {
+		if otp == nil {
 			log.Debug().Msg("OTP not found")
 			return nil, fmt.Errorf(`OTP not found`)
 		}
-		if params.Otp != otp.Otp {
+		// OTPs are stored as HMAC-SHA256 digests so an offline DB dump no
+		// longer reveals usable codes. We deliberately do NOT fall back
+		// to literal equality — accepting the stored value verbatim
+		// would turn the digest itself into a usable credential.
+		if !crypto.VerifyOTPHash(params.Otp, otp.Otp, g.Config.JWTSecret) {
 			log.Debug().Msg("Failed to verify otp request: OTP mismatch")
 			return nil, fmt.Errorf(`invalid otp`)
 		}
@@ -120,7 +126,7 @@ func (g *graphqlProvider) VerifyOTP(ctx context.Context, params *model.VerifyOTP
 
 	if _, err := g.MemoryStoreProvider.GetMfaSession(user.ID, mfaSession); err != nil {
 		log.Debug().Err(err).Msg("Failed to get mfa session")
-		return nil, fmt.Errorf(`invalid session: %s`, err.Error())
+		return nil, fmt.Errorf(`invalid session`)
 	}
 
 	isSignUp := false
@@ -150,6 +156,8 @@ func (g *graphqlProvider) VerifyOTP(ctx context.Context, params *model.VerifyOTP
 	code := ""
 	codeChallenge := ""
 	nonce := ""
+	oidcNonce := ""
+	authorizeRedirectURI := ""
 	if params.State != nil {
 		// Get state from store
 		authorizeState, _ := g.MemoryStoreProvider.GetState(refs.StringValue(params.State))
@@ -158,23 +166,29 @@ func (g *graphqlProvider) VerifyOTP(ctx context.Context, params *model.VerifyOTP
 			if len(authorizeStateSplit) > 1 {
 				code = authorizeStateSplit[0]
 				codeChallenge = authorizeStateSplit[1]
+				if len(authorizeStateSplit) > 2 {
+					oidcNonce = authorizeStateSplit[2]
+				}
+				if len(authorizeStateSplit) > 3 {
+					authorizeRedirectURI = authorizeStateSplit[3]
+				}
 			} else {
 				nonce = authorizeState
 			}
-			go g.MemoryStoreProvider.RemoveState(refs.StringValue(params.State))
+			g.MemoryStoreProvider.RemoveState(refs.StringValue(params.State))
 		}
 	}
 	if nonce == "" {
 		nonce = uuid.New().String()
 	}
 	hostname := parsers.GetHost(gc)
-	// user, roles, scope, loginMethod, nonce, code
 	authToken, err := g.TokenProvider.CreateAuthToken(gc, &token.AuthTokenConfig{
 		User:        user,
 		Roles:       roles,
 		Scope:       scope,
 		LoginMethod: loginMethod,
 		Nonce:       nonce,
+		OIDCNonce:   oidcNonce,
 		Code:        code,
 		HostName:    hostname,
 	})
@@ -185,7 +199,7 @@ func (g *graphqlProvider) VerifyOTP(ctx context.Context, params *model.VerifyOTP
 
 	// Code challenge could be optional if PKCE flow is not used
 	if code != "" {
-		if err := g.MemoryStoreProvider.SetState(code, codeChallenge+"@@"+authToken.FingerPrintHash); err != nil {
+		if err := g.MemoryStoreProvider.SetState(code, codeChallenge+"@@"+authToken.FingerPrintHash+"@@"+oidcNonce+"@@"+authorizeRedirectURI); err != nil {
 			log.Debug().Err(err).Msg("Failed to set state")
 			return nil, err
 		}
@@ -208,6 +222,29 @@ func (g *graphqlProvider) VerifyOTP(ctx context.Context, params *model.VerifyOTP
 			log.Debug().Err(err).Msg("Failed to add session")
 		}
 	}()
+	if isEmailVerification {
+		g.AuditProvider.LogEvent(audit.Event{
+			Action:       constants.AuditEmailVerifiedEvent,
+			ActorID:      user.ID,
+			ActorType:    constants.AuditActorTypeUser,
+			ActorEmail:   refs.StringValue(user.Email),
+			ResourceType: constants.AuditResourceTypeUser,
+			ResourceID:   user.ID,
+			IPAddress:    utils.GetIP(gc.Request),
+			UserAgent:    utils.GetUserAgent(gc.Request),
+		})
+	} else {
+		g.AuditProvider.LogEvent(audit.Event{
+			Action:       constants.AuditPhoneVerifiedEvent,
+			ActorID:      user.ID,
+			ActorType:    constants.AuditActorTypeUser,
+			ActorEmail:   refs.StringValue(user.Email),
+			ResourceType: constants.AuditResourceTypeUser,
+			ResourceID:   user.ID,
+			IPAddress:    utils.GetIP(gc.Request),
+			UserAgent:    utils.GetUserAgent(gc.Request),
+		})
+	}
 
 	authTokenExpiresIn := authToken.AccessToken.ExpiresAt - time.Now().Unix()
 	if authTokenExpiresIn <= 0 {
@@ -223,7 +260,7 @@ func (g *graphqlProvider) VerifyOTP(ctx context.Context, params *model.VerifyOTP
 	}
 
 	sessionKey := loginMethod + ":" + user.ID
-	cookie.SetSession(gc, authToken.FingerPrintHash, g.Config.AppCookieSecure)
+	cookie.SetSession(gc, authToken.FingerPrintHash, g.Config.AppCookieSecure, cookie.ParseSameSite(g.Config.AppCookieSameSite))
 	g.MemoryStoreProvider.SetUserSession(sessionKey, constants.TokenTypeSessionToken+"_"+authToken.FingerPrint, authToken.FingerPrintHash, authToken.SessionTokenExpiresAt)
 	g.MemoryStoreProvider.SetUserSession(sessionKey, constants.TokenTypeAccessToken+"_"+authToken.FingerPrint, authToken.AccessToken.Token, authToken.AccessToken.ExpiresAt)
 

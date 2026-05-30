@@ -2,15 +2,18 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"strings"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
 	"github.com/authorizerdev/authorizer/internal/authenticators"
 	"github.com/authorizerdev/authorizer/internal/config"
 	"github.com/authorizerdev/authorizer/internal/constants"
@@ -18,7 +21,9 @@ import (
 	"github.com/authorizerdev/authorizer/internal/events"
 	"github.com/authorizerdev/authorizer/internal/http_handlers"
 	"github.com/authorizerdev/authorizer/internal/memory_store"
+	"github.com/authorizerdev/authorizer/internal/metrics"
 	"github.com/authorizerdev/authorizer/internal/oauth"
+	"github.com/authorizerdev/authorizer/internal/rate_limit"
 	"github.com/authorizerdev/authorizer/internal/server"
 	"github.com/authorizerdev/authorizer/internal/sms"
 	"github.com/authorizerdev/authorizer/internal/storage"
@@ -27,13 +32,17 @@ import (
 
 // Default values for flags (single source of truth for init and applyFlagDefaults).
 var (
-	defaultHost              = "0.0.0.0"
-	defaultLogLevel          = "debug"
-	defaultHTTPPort          = 8080
-	defaultMetricsPort       = 8081
-	defaultOrganizationLogo  = "https://authorizer.dev/images/logo.png"
-	defaultOrganizationName  = "Authorizer"
-	defaultAdminSecret       = "password"
+	defaultHost             = "0.0.0.0"
+	defaultMetricsHost      = "127.0.0.1"
+	defaultLogLevel         = "debug"
+	defaultHTTPPort         = 8080
+	defaultMetricsPort      = 8081
+	defaultOrganizationLogo = "https://authorizer.dev/images/logo.png"
+	defaultOrganizationName = "Authorizer"
+	// defaultAdminSecret intentionally REMOVED. Admin secret must be supplied
+	// explicitly via --admin-secret. The startup check in runRoot rejects
+	// only the empty value; the strength of the supplied secret is the
+	// operator's responsibility.
 	defaultJWTRoleClaim      = "role"
 	defaultMicrosoftTenantID = "common"
 	defaultAllowedOrigins    = []string{"*"}
@@ -48,6 +57,9 @@ var (
 	defaultDiscordScopes     = []string{"identify", "email"}
 	defaultTwitterScopes     = []string{"tweet.read", "users.read"}
 	defaultRobloxScopes      = []string{"openid", "profile"}
+	// Default RPS cap per IP; raised from 10 to reduce false positives on busy UIs.
+	defaultRateLimitRPS   = 30
+	defaultRateLimitBurst = 20
 )
 
 var (
@@ -68,7 +80,8 @@ func init() {
 	// Server flags
 	f.StringVar(&rootArgs.server.Host, "host", defaultHost, "Host address to listen on")
 	f.IntVar(&rootArgs.server.HTTPPort, "http-port", defaultHTTPPort, "Port to serve HTTP requests on")
-	f.IntVar(&rootArgs.server.MetricsPort, "metrics-port", defaultMetricsPort, "Port to serve metrics requests on")
+	f.IntVar(&rootArgs.server.MetricsPort, "metrics-port", defaultMetricsPort, "Port for the dedicated /metrics listener (must differ from --http-port)")
+	f.StringVar(&rootArgs.server.MetricsHost, "metrics-host", defaultMetricsHost, "Bind address for the dedicated /metrics listener (default loopback; use 0.0.0.0 when Prometheus scrapes from another host/pod)")
 
 	// Logging flags
 	f.StringVar(&rootArgs.logLevel, "log-level", defaultLogLevel, "Log level to use")
@@ -80,6 +93,12 @@ func init() {
 	f.BoolVar(&rootArgs.config.EnableLoginPage, "enable-login-page", true, "Enable login page")
 	f.BoolVar(&rootArgs.config.EnablePlayground, "enable-playground", true, "Enable playground")
 	f.BoolVar(&rootArgs.config.EnableGraphQLIntrospection, "enable-graphql-introspection", true, "Enable GraphQL introspection for the /graphql endpoint")
+	f.BoolVar(&rootArgs.config.EnableHSTS, "enable-hsts", false, "Enable Strict-Transport-Security response header (only enable behind TLS)")
+	f.BoolVar(&rootArgs.config.DisableCSP, "disable-csp", false, "Disable the default Content-Security-Policy response header")
+	f.IntVar(&rootArgs.config.GraphQLMaxComplexity, "graphql-max-complexity", 300, "Maximum total complexity score for a single GraphQL operation")
+	f.IntVar(&rootArgs.config.GraphQLMaxDepth, "graphql-max-depth", 15, "Maximum nesting depth of a GraphQL selection set")
+	f.IntVar(&rootArgs.config.GraphQLMaxAliases, "graphql-max-aliases", 30, "Maximum total number of aliased fields per GraphQL operation")
+	f.Int64Var(&rootArgs.config.GraphQLMaxBodyBytes, "graphql-max-body-bytes", 1<<20, "Maximum allowed GraphQL request body size in bytes (default 1MB)")
 
 	// Organization flags
 	f.StringVar(&rootArgs.config.OrganizationLogo, "organization-logo", defaultOrganizationLogo, "Logo of the organization")
@@ -92,7 +111,8 @@ func init() {
 	f.StringVar(&rootArgs.config.DefaultAuthorizeResponseType, "default-authorize-response-type", constants.ResponseTypeToken, "Default response type for the authorize endpoint")
 
 	// Admin flags
-	f.StringVar(&rootArgs.config.AdminSecret, "admin-secret", defaultAdminSecret, "Secret for the admin")
+	f.StringVar(&rootArgs.config.AdminSecret, "admin-secret", "", "Secret for the admin (REQUIRED, must not be empty)")
+	f.Int64Var(&rootArgs.config.RefreshTokenExpiresIn, "refresh-token-expires-in", 60*60*24*30, "Refresh token lifetime in seconds (default: 30 days = 2592000)")
 
 	// Allowed origins
 	f.StringSliceVar(&rootArgs.config.AllowedOrigins, "allowed-origins", defaultAllowedOrigins, "Allowed origins")
@@ -147,14 +167,26 @@ func init() {
 
 	// Cookies flags
 	f.BoolVar(&rootArgs.config.AppCookieSecure, "app-cookie-secure", true, "Application secure cookie flag")
+	f.StringVar(&rootArgs.config.AppCookieSameSite, "app-cookie-same-site", "none", "SameSite attribute for session cookies (lax, strict, none)")
 	f.BoolVar(&rootArgs.config.AdminCookieSecure, "admin-cookie-secure", true, "Admin secure cookie flag")
 	f.BoolVar(&rootArgs.config.DisableAdminHeaderAuth, "disable-admin-header-auth", false, "Disable admin authentication via X-Authorizer-Admin-Secret header")
+
+	// Rate limiting flags
+	f.IntVar(&rootArgs.config.RateLimitRPS, "rate-limit-rps", defaultRateLimitRPS, "Maximum requests per second per IP for rate limiting")
+	f.IntVar(&rootArgs.config.RateLimitBurst, "rate-limit-burst", defaultRateLimitBurst, "Maximum burst size per IP for rate limiting")
+	f.BoolVar(&rootArgs.config.RateLimitFailClosed, "rate-limit-fail-closed", false, "On rate-limit backend errors, reject with 503 instead of allowing the request")
+	f.StringSliceVar(&rootArgs.config.TrustedProxies, "trusted-proxies", nil, "Comma-separated CIDRs of trusted reverse proxies. When set, gin uses X-Forwarded-For from these networks. Empty (default) trusts no proxies and uses RemoteAddr.")
 
 	// JWT flags
 	f.StringVar(&rootArgs.config.JWTType, "jwt-type", "", "Type of JWT to use")
 	f.StringVar(&rootArgs.config.JWTSecret, "jwt-secret", "", "Secret for the JWT")
 	f.StringVar(&rootArgs.config.JWTPrivateKey, "jwt-private-key", "", "Private key for the JWT")
 	f.StringVar(&rootArgs.config.JWTPublicKey, "jwt-public-key", "", "Public key for the JWT")
+	// JWT secondary key flags (for manual key rotation)
+	f.StringVar(&rootArgs.config.JWTSecondaryType, "jwt-secondary-type", "", "Algorithm of the optional secondary JWT key used for manual rotation. When set, JWKS publishes both keys and token validation accepts either. New tokens are always signed with the primary (--jwt-type) key.")
+	f.StringVar(&rootArgs.config.JWTSecondarySecret, "jwt-secondary-secret", "", "Secret for the secondary JWT key (HMAC only; never exposed via JWKS)")
+	f.StringVar(&rootArgs.config.JWTSecondaryPrivateKey, "jwt-secondary-private-key", "", "Private key for the secondary JWT key. Currently unused — verification only uses the public key; kept for symmetry with --jwt-private-key and for future primary/secondary swap automation.")
+	f.StringVar(&rootArgs.config.JWTSecondaryPublicKey, "jwt-secondary-public-key", "", "Public key for the secondary JWT key. Used to verify tokens signed with the secondary key during rotation.")
 	f.StringVar(&rootArgs.config.JWTRoleClaim, "jwt-role-claim", defaultJWTRoleClaim, "Role claim for the JWT")
 	f.StringVar(&rootArgs.config.CustomAccessTokenScript, "custom-access-token-script", "", "Custom access token script")
 
@@ -200,6 +232,9 @@ func init() {
 	// URLs
 	f.StringVar(&rootArgs.config.ResetPasswordURL, "reset-password-url", "", "URL for reset password")
 
+	// Back-channel logout (OIDC BCL 1.0)
+	f.StringVar(&rootArgs.config.BackchannelLogoutURI, "backchannel-logout-uri", "", "URL to POST a signed logout_token to when users log out successfully. Leave empty (default) to disable back-channel logout notifications. See OIDC Back-Channel Logout 1.0.")
+
 	// Deprecated flags
 	f.MarkDeprecated("database_url", "use --database-url instead")
 	f.MarkDeprecated("database_type", "use --database-type instead")
@@ -220,6 +255,9 @@ func applyFlagDefaults() {
 	if s.MetricsPort == 0 {
 		s.MetricsPort = defaultMetricsPort
 	}
+	if strings.TrimSpace(s.MetricsHost) == "" {
+		s.MetricsHost = defaultMetricsHost
+	}
 	if strings.TrimSpace(rootArgs.logLevel) == "" {
 		rootArgs.logLevel = defaultLogLevel
 	}
@@ -235,9 +273,9 @@ func applyFlagDefaults() {
 	if strings.TrimSpace(c.DefaultAuthorizeResponseType) == "" {
 		c.DefaultAuthorizeResponseType = constants.ResponseTypeToken
 	}
-	if strings.TrimSpace(c.AdminSecret) == "" {
-		c.AdminSecret = defaultAdminSecret
-	}
+	// AdminSecret deliberately has NO default. The fatal check in runRoot
+	// rejects empty values at startup; secret strength is the operator's
+	// responsibility.
 	if len(c.AllowedOrigins) == 0 {
 		c.AllowedOrigins = append([]string(nil), defaultAllowedOrigins...)
 	}
@@ -288,6 +326,20 @@ func applyFlagDefaults() {
 // Run the service
 func runRoot(c *cobra.Command, args []string) {
 	applyFlagDefaults()
+	if rootArgs.server.HTTPPort == rootArgs.server.MetricsPort {
+		fmt.Fprintf(os.Stderr, "invalid server ports: --http-port and --metrics-port must differ (metrics are always served on a dedicated listener)\n")
+		os.Exit(1)
+	}
+
+	// Refuse to start without an admin secret. The previous default of
+	// "password" was a publicly known credential — operators upgrading from
+	// older versions must now supply --admin-secret explicitly. The strength
+	// of the supplied value is the operator's responsibility; we only
+	// guarantee it is non-empty.
+	if strings.TrimSpace(rootArgs.config.AdminSecret) == "" {
+		fmt.Fprintln(os.Stderr, "FATAL: --admin-secret is required and must not be empty.")
+		os.Exit(1)
+	}
 
 	// Prepare logger
 	ctx := context.Background()
@@ -309,6 +361,19 @@ func runRoot(c *cobra.Command, args []string) {
 		Level(zeroLogLevel).
 		With().Timestamp().Logger()
 
+	// Warn if AllowedOrigins is the wildcard ["*"] — this is a development-
+	// friendly default but in production it pairs poorly with credentialed
+	// requests. Operators should set an explicit allowlist before deploying.
+	for _, o := range rootArgs.config.AllowedOrigins {
+		if o == "*" {
+			log.Warn().Msg("AllowedOrigins contains \"*\" — this is unsafe for production. Set --allowed-origins to an explicit list of trusted origins. CSRF middleware will fall back to same-origin enforcement for state-changing requests.")
+			break
+		}
+	}
+
+	// Initialize prometheus metrics
+	metrics.Init()
+
 	// Derive IsEmailServiceEnabled from SMTP config
 	rootArgs.config.IsEmailServiceEnabled = strings.TrimSpace(rootArgs.config.SMTPHost) != "" &&
 		rootArgs.config.SMTPPort > 0 &&
@@ -327,6 +392,11 @@ func runRoot(c *cobra.Command, args []string) {
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to create storage provider")
 	}
+	defer func() {
+		if err := storageProvider.Close(); err != nil {
+			log.Error().Err(err).Msg("failed to close storage provider")
+		}
+	}()
 
 	// Authenticator provider
 	authenticatorProvider, err := authenticators.New(&rootArgs.config, &authenticators.Dependencies{
@@ -364,6 +434,27 @@ func runRoot(c *cobra.Command, args []string) {
 		log.Fatal().Err(err).Msg("failed to create memory store provider")
 	}
 
+	// Rate limit provider
+	rateLimitDeps := &rate_limit.Dependencies{
+		Log: &log,
+	}
+	// If memory store is Redis-backed, reuse its client for distributed rate limiting
+	type redisClientProvider interface {
+		Client() interface {
+			Eval(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd
+		}
+	}
+	if rcp, ok := memoryStoreProvider.(redisClientProvider); ok {
+		if client, ok := rcp.Client().(rate_limit.RedisClient); ok {
+			rateLimitDeps.RedisStore = client
+		}
+	}
+	rateLimitProvider, err := rate_limit.New(&rootArgs.config, rateLimitDeps)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to create rate limit provider")
+	}
+	defer rateLimitProvider.Close()
+
 	// SMS provider
 	smsProvider, err := sms.New(&rootArgs.config, &sms.Dependencies{
 		Log: &log,
@@ -397,8 +488,14 @@ func runRoot(c *cobra.Command, args []string) {
 		log.Fatal().Msg("client secret missing in rootArgs")
 	}
 
+	auditProvider := audit.New(&audit.Dependencies{
+		Log:             &log,
+		StorageProvider: storageProvider,
+	})
+
 	httpProvider, err := http_handlers.New(&rootArgs.config, &http_handlers.Dependencies{
 		Log:                   &log,
+		AuditProvider:         auditProvider,
 		AuthenticatorProvider: authenticatorProvider,
 		EmailProvider:         emailProvider,
 		EventsProvider:        eventsProvider,
@@ -407,6 +504,7 @@ func runRoot(c *cobra.Command, args []string) {
 		StorageProvider:       storageProvider,
 		TokenProvider:         tokenProvider,
 		OAuthProvider:         oauthProvider,
+		RateLimitProvider:     rateLimitProvider,
 	})
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to create http provider")
@@ -414,6 +512,7 @@ func runRoot(c *cobra.Command, args []string) {
 	// Prepare server
 	deps := &server.Dependencies{
 		Log:          &log,
+		AppConfig:    &rootArgs.config,
 		HTTPProvider: httpProvider,
 	}
 	// Create the server

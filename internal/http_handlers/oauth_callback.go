@@ -1,11 +1,12 @@
 package http_handlers
 
 import (
-	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -14,14 +15,18 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	goredis "github.com/redis/go-redis/v9"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
 	"github.com/authorizerdev/authorizer/internal/constants"
 	"github.com/authorizerdev/authorizer/internal/cookie"
+	"github.com/authorizerdev/authorizer/internal/metrics"
 	"github.com/authorizerdev/authorizer/internal/parsers"
 	"github.com/authorizerdev/authorizer/internal/refs"
 	"github.com/authorizerdev/authorizer/internal/storage/schemas"
 	"github.com/authorizerdev/authorizer/internal/token"
 	"github.com/authorizerdev/authorizer/internal/utils"
+	"github.com/authorizerdev/authorizer/internal/validators"
 )
 
 // AppleUserInfo is the struct for apple user info
@@ -45,6 +50,16 @@ func (h *httpProvider) OAuthCallbackHandler() gin.HandlerFunc {
 			ctx.JSON(400, gin.H{"error": "invalid oauth state"})
 			return
 		}
+		// `sessionState` is the oauth provider saved during `/oauth_login/:oauth_provider`.
+		// Ensure the callback route's provider matches what was originally requested.
+		if sessionState != provider {
+			log.Debug().
+				Str("expected_provider", sessionState).
+				Str("callback_provider", provider).
+				Msg("OAuth provider mismatch for state")
+			ctx.JSON(400, gin.H{"error": "invalid oauth state"})
+			return
+		}
 		// contains random token, redirect url, role
 		sessionSplit := strings.Split(state, "___")
 
@@ -54,20 +69,18 @@ func (h *httpProvider) OAuthCallbackHandler() gin.HandlerFunc {
 			return
 		}
 		// remove state from store
-		go h.MemoryStoreProvider.RemoveState(state)
+		h.MemoryStoreProvider.RemoveState(state)
 		stateValue := sessionSplit[0]
 		redirectURL := sessionSplit[1]
+		hostname := parsers.GetHost(ctx)
+		if !validators.IsValidRedirectURI(redirectURL, h.Config.AllowedOrigins, hostname) {
+			log.Debug().Msg("Invalid redirect URI in OAuth state")
+			ctx.JSON(400, gin.H{"error": "invalid redirect uri"})
+			return
+		}
 		inputRoles := strings.Split(sessionSplit[2], ",")
 		scopeString := sessionSplit[3]
-		scopes := []string{}
-		if scopeString != "" {
-			if strings.Contains(scopeString, ",") {
-				scopes = strings.Split(scopeString, ",")
-			}
-			if strings.Contains(scopeString, " ") {
-				scopes = strings.Split(scopeString, " ")
-			}
-		}
+		scopes := parseScopes(scopeString)
 		var user *schemas.User
 		oauthCode := ctx.Request.FormValue("code")
 		if oauthCode == "" {
@@ -111,7 +124,20 @@ func (h *httpProvider) OAuthCallbackHandler() gin.HandlerFunc {
 
 		if err != nil {
 			log.Debug().Err(err).Msg("Failed to process user info")
-			ctx.JSON(400, gin.H{"error": err.Error()})
+			metrics.RecordAuthEvent(metrics.EventOAuthCallback, metrics.StatusFailure)
+			metrics.RecordSecurityEvent("oauth_callback_failed", provider)
+			h.AuditProvider.LogEvent(audit.Event{
+				Action:       constants.AuditOAuthCallbackFailedEvent,
+				ActorType:    constants.AuditActorTypeUser,
+				ResourceType: constants.AuditResourceTypeSession,
+				Metadata:     provider,
+				IPAddress:    utils.GetIP(ctx.Request),
+				UserAgent:    utils.GetUserAgent(ctx.Request),
+			})
+			ctx.JSON(400, gin.H{
+				"error":             "oauth_callback_failed",
+				"error_description": "OAuth callback could not be completed. Please try again.",
+			})
 			return
 		}
 		if user == nil {
@@ -156,13 +182,25 @@ func (h *httpProvider) OAuthCallbackHandler() gin.HandlerFunc {
 			user, err = h.StorageProvider.AddUser(ctx, user)
 			if err != nil {
 				log.Debug().Err(err).Msg("Failed to add user")
-				ctx.JSON(500, gin.H{"error": err.Error()})
+				ctx.JSON(500, gin.H{"error": "failed to process OAuth login"})
 				return
 			}
 			isSignUp = true
 		} else {
 			if existingUser.RevokedTimestamp != nil {
 				log.Debug().Msg("User access has been revoked")
+				metrics.RecordAuthEvent(metrics.EventOAuthCallback, metrics.StatusFailure)
+				metrics.RecordSecurityEvent("account_revoked", "oauth_callback")
+				h.AuditProvider.LogEvent(audit.Event{
+					Action:       constants.AuditOAuthCallbackFailedEvent,
+					ActorID:      existingUser.ID,
+					ActorType:    constants.AuditActorTypeUser,
+					ActorEmail:   refs.StringValue(existingUser.Email),
+					ResourceType: constants.AuditResourceTypeSession,
+					Metadata:     provider,
+					IPAddress:    utils.GetIP(ctx.Request),
+					UserAgent:    utils.GetUserAgent(ctx.Request),
+				})
 				ctx.JSON(400, gin.H{"error": "user access has been revoked"})
 				return
 			}
@@ -197,7 +235,7 @@ func (h *httpProvider) OAuthCallbackHandler() gin.HandlerFunc {
 				user, err = h.StorageProvider.AddUser(ctx, user)
 				if err != nil {
 					log.Debug().Err(err).Msg("Failed to add user after removing unverified account")
-					ctx.JSON(500, gin.H{"error": err.Error()})
+					ctx.JSON(500, gin.H{"error": "failed to process OAuth login"})
 					return
 				}
 				isSignUp = true
@@ -250,36 +288,28 @@ func (h *httpProvider) OAuthCallbackHandler() gin.HandlerFunc {
 				user, err = h.StorageProvider.UpdateUser(ctx, user)
 				if err != nil {
 					log.Debug().Err(err).Msg("Failed to update user")
-					ctx.JSON(500, gin.H{"error": err.Error()})
+					ctx.JSON(500, gin.H{"error": "failed to process OAuth login"})
 					return
 				}
 			}
 		}
 
-		// TODO
-		// use stateValue to get code / nonce
-		// add code / nonce to id_token
-		code := ""
-		codeChallenge := ""
-		nonce := ""
-		if stateValue != "" {
-			// Get state from store
-			authorizeState, _ := h.MemoryStoreProvider.GetState(stateValue)
-			if authorizeState != "" {
-				authorizeStateSplit := strings.Split(authorizeState, "@@")
-				if len(authorizeStateSplit) > 1 {
-					code = authorizeStateSplit[0]
-					codeChallenge = authorizeStateSplit[1]
-				} else {
-					nonce = authorizeState
-				}
-				go h.MemoryStoreProvider.RemoveState(stateValue)
-			}
+		// OIDC `/authorize` bridge:
+		// If this social-login callback was initiated from the OpenID Connect authorize flow
+		// (`/authorize?...&state=<stateValue>...`), `authorize.go` stores a temporary entry keyed by `stateValue`
+		// containing either:
+		// - `nonce` (implicit/hybrid-style response), OR
+		// - `code@@codeChallenge` (authorization code + PKCE).
+		//
+		// In the standalone social login flow (`/oauth_login/:provider`), this entry will not exist and we
+		// simply generate a nonce and continue.
+		code, codeChallenge, nonce, authorizeRedirectURI, err := h.consumeAuthorizeState(stateValue)
+		if err != nil && !errors.Is(err, goredis.Nil) {
+			log.Debug().Err(err).Str("state", stateValue).Msg("Failed to get authorize state from store")
 		}
 		if nonce == "" {
 			nonce = uuid.New().String()
 		}
-		hostname := parsers.GetHost(ctx)
 		//  user, inputRoles, scopes, provider, nonce, code
 		authToken, err := h.TokenProvider.CreateAuthToken(ctx, &token.AuthTokenConfig{
 			User:        user,
@@ -291,15 +321,15 @@ func (h *httpProvider) OAuthCallbackHandler() gin.HandlerFunc {
 		})
 		if err != nil {
 			log.Debug().Err(err).Msg("Failed to create auth token")
-			ctx.JSON(500, gin.H{"error": err.Error()})
+			ctx.JSON(500, gin.H{"error": "failed to process OAuth login"})
 			return
 		}
 
 		// Code challenge could be optional if PKCE flow is not used
 		if code != "" {
-			if err := h.MemoryStoreProvider.SetState(code, codeChallenge+"@@"+authToken.FingerPrintHash); err != nil {
+			if err := h.MemoryStoreProvider.SetState(code, codeChallenge+"@@"+authToken.FingerPrintHash+"@@"+nonce+"@@"+url.QueryEscape(authorizeRedirectURI)); err != nil {
 				log.Debug().Err(err).Msg("Failed to set state")
-				ctx.JSON(500, gin.H{"error": err.Error()})
+				ctx.JSON(500, gin.H{"error": "failed to process OAuth login"})
 				return
 			}
 		}
@@ -317,12 +347,11 @@ func (h *httpProvider) OAuthCallbackHandler() gin.HandlerFunc {
 		}
 
 		sessionKey := provider + ":" + user.ID
-		cookie.SetSession(ctx, authToken.FingerPrintHash, h.Config.AppCookieSecure)
+		cookie.SetSession(ctx, authToken.FingerPrintHash, h.Config.AppCookieSecure, cookie.ParseSameSite(h.Config.AppCookieSameSite))
 		h.MemoryStoreProvider.SetUserSession(sessionKey, constants.TokenTypeSessionToken+"_"+authToken.FingerPrint, authToken.FingerPrintHash, authToken.SessionTokenExpiresAt)
 		h.MemoryStoreProvider.SetUserSession(sessionKey, constants.TokenTypeAccessToken+"_"+authToken.FingerPrint, authToken.AccessToken.Token, authToken.AccessToken.ExpiresAt)
 
 		if authToken.RefreshToken != nil {
-			params += `&refresh_token=` + authToken.RefreshToken.Token
 			h.MemoryStoreProvider.SetUserSession(sessionKey, constants.TokenTypeRefreshToken+"_"+authToken.FingerPrint, authToken.RefreshToken.Token, authToken.RefreshToken.ExpiresAt)
 		}
 
@@ -347,7 +376,21 @@ func (h *httpProvider) OAuthCallbackHandler() gin.HandlerFunc {
 		} else {
 			redirectURL = redirectURL + "?" + strings.TrimPrefix(params, "&")
 		}
-
+		// remove state from store
+		h.MemoryStoreProvider.RemoveState(state)
+		metrics.RecordAuthEvent(metrics.EventOAuthCallback, metrics.StatusSuccess)
+		metrics.ActiveSessions.Inc()
+		h.AuditProvider.LogEvent(audit.Event{
+			Action:       constants.AuditOAuthCallbackSuccessEvent,
+			ActorID:      user.ID,
+			ActorType:    constants.AuditActorTypeUser,
+			ActorEmail:   refs.StringValue(user.Email),
+			ResourceType: constants.AuditResourceTypeSession,
+			ResourceID:   user.ID,
+			Metadata:     provider,
+			IPAddress:    utils.GetIP(ctx.Request),
+			UserAgent:    utils.GetUserAgent(ctx.Request),
+		})
 		ctx.Redirect(http.StatusFound, redirectURL)
 	}
 }
@@ -433,7 +476,10 @@ func (h *httpProvider) processGithubUserInfo(ctx *gin.Context, code string) (*sc
 	}
 
 	userRawData := make(map[string]string)
-	json.Unmarshal(body, &userRawData)
+	if err := json.Unmarshal(body, &userRawData); err != nil {
+		log.Debug().Err(err).Msg("Failed to unmarshal github user info")
+		return nil, fmt.Errorf("failed to parse github user info: %s", err.Error())
+	}
 
 	name := strings.Split(userRawData["name"], " ")
 	firstName := ""
@@ -442,7 +488,7 @@ func (h *httpProvider) processGithubUserInfo(ctx *gin.Context, code string) (*sc
 		firstName = name[0]
 	}
 	if len(name) > 1 && strings.TrimSpace(name[1]) != "" {
-		lastName = name[0]
+		lastName = name[1]
 	}
 
 	picture := userRawData["avatar_url"]
@@ -542,15 +588,21 @@ func (h *httpProvider) processFacebookUserInfo(ctx *gin.Context, code string) (*
 		return nil, fmt.Errorf("failed to request facebook user info: %s", string(body))
 	}
 	userRawData := make(map[string]interface{})
-	json.Unmarshal(body, &userRawData)
+	if err := json.Unmarshal(body, &userRawData); err != nil {
+		log.Debug().Err(err).Msg("Failed to unmarshal facebook user info")
+		return nil, fmt.Errorf("failed to parse facebook user info: %s", err.Error())
+	}
 
 	email := fmt.Sprintf("%v", userRawData["email"])
 
-	picObject := userRawData["picture"].(map[string]interface{})["data"]
-	picDataObject := picObject.(map[string]interface{})
+	picture := ""
+	if picObj, ok := userRawData["picture"].(map[string]interface{}); ok {
+		if picData, ok := picObj["data"].(map[string]interface{}); ok {
+			picture = fmt.Sprintf("%v", picData["url"])
+		}
+	}
 	firstName := fmt.Sprintf("%v", userRawData["first_name"])
 	lastName := fmt.Sprintf("%v", userRawData["last_name"])
-	picture := fmt.Sprintf("%v", picDataObject["url"])
 
 	user := &schemas.User{
 		GivenName:  &firstName,
@@ -605,7 +657,10 @@ func (h *httpProvider) processLinkedInUserInfo(ctx *gin.Context, code string) (*
 	}
 
 	userRawData := make(map[string]interface{})
-	json.Unmarshal(body, &userRawData)
+	if err := json.Unmarshal(body, &userRawData); err != nil {
+		log.Debug().Err(err).Msg("Failed to unmarshal linkedin user info")
+		return nil, fmt.Errorf("failed to parse linkedin user info: %s", err.Error())
+	}
 
 	req, err = http.NewRequest("GET", constants.LinkedInEmailURL, nil)
 	if err != nil {
@@ -633,12 +688,42 @@ func (h *httpProvider) processLinkedInUserInfo(ctx *gin.Context, code string) (*
 		return nil, fmt.Errorf("failed to request linkedin user info: %s", string(body))
 	}
 	emailRawData := make(map[string]interface{})
-	json.Unmarshal(body, &emailRawData)
+	if err := json.Unmarshal(body, &emailRawData); err != nil {
+		log.Debug().Err(err).Msg("Failed to unmarshal linkedin email info")
+		return nil, fmt.Errorf("failed to parse linkedin email info: %s", err.Error())
+	}
 
-	firstName := userRawData["localizedFirstName"].(string)
-	lastName := userRawData["localizedLastName"].(string)
-	profilePicture := userRawData["profilePicture"].(map[string]interface{})["displayImage~"].(map[string]interface{})["elements"].([]interface{})[0].(map[string]interface{})["identifiers"].([]interface{})[0].(map[string]interface{})["identifier"].(string)
-	emailAddress := emailRawData["elements"].([]interface{})[0].(map[string]interface{})["handle~"].(map[string]interface{})["emailAddress"].(string)
+	firstName, _ := userRawData["localizedFirstName"].(string)
+	lastName, _ := userRawData["localizedLastName"].(string)
+
+	// Safely extract profile picture from nested LinkedIn structure
+	profilePicture := ""
+	if pp, ok := userRawData["profilePicture"].(map[string]interface{}); ok {
+		if di, ok := pp["displayImage~"].(map[string]interface{}); ok {
+			if elems, ok := di["elements"].([]interface{}); ok && len(elems) > 0 {
+				if elem, ok := elems[0].(map[string]interface{}); ok {
+					if ids, ok := elem["identifiers"].([]interface{}); ok && len(ids) > 0 {
+						if id, ok := ids[0].(map[string]interface{}); ok {
+							profilePicture, _ = id["identifier"].(string)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Safely extract email from nested LinkedIn structure
+	emailAddress := ""
+	if elems, ok := emailRawData["elements"].([]interface{}); ok && len(elems) > 0 {
+		if elem, ok := elems[0].(map[string]interface{}); ok {
+			if handle, ok := elem["handle~"].(map[string]interface{}); ok {
+				emailAddress, _ = handle["emailAddress"].(string)
+			}
+		}
+	}
+	if emailAddress == "" {
+		return nil, fmt.Errorf("failed to extract email from linkedin response")
+	}
 
 	user := &schemas.User{
 		GivenName:  &firstName,
@@ -672,44 +757,37 @@ func (h *httpProvider) processAppleUserInfo(ctx *gin.Context, code string, user_
 		return user, fmt.Errorf("unable to extract id_token")
 	}
 
-	tokenSplit := strings.Split(rawIDToken, ".")
-	claimsData := tokenSplit[1]
-	decodedClaimsData, err := base64.RawURLEncoding.DecodeString(claimsData)
+	// Verify the Apple ID token signature, issuer, and audience using OIDC discovery
+	oidcProvider, err := oidc.NewProvider(ctx, "https://appleid.apple.com")
 	if err != nil {
-		log.Debug().Err(err).Msg("Failed to decode claims data")
-		return user, fmt.Errorf("failed to decrypt claims data: %s", err.Error())
+		log.Debug().Err(err).Msg("Failed to create Apple OIDC provider")
+		return user, fmt.Errorf("failed to create oidc provider: %s", err.Error())
+	}
+	verifier := oidcProvider.Verifier(&oidc.Config{ClientID: h.AppleClientID})
+	idToken, err := verifier.Verify(ctx, rawIDToken)
+	if err != nil {
+		log.Debug().Err(err).Msg("Failed to verify Apple ID Token")
+		return user, fmt.Errorf("unable to verify id_token: %s", err.Error())
 	}
 
 	claims := make(map[string]interface{})
-	err = json.Unmarshal(decodedClaimsData, &claims)
-	if err != nil {
-		log.Debug().Err(err).Msg("Failed to unmarshal claims data")
-		return user, fmt.Errorf("failed to unmarshal claims data: %s", err.Error())
+	if err := idToken.Claims(&claims); err != nil {
+		log.Debug().Err(err).Msg("Failed to parse Apple ID Token claims")
+		return user, fmt.Errorf("failed to parse claims: %s", err.Error())
 	}
+
 	if val, ok := claims["email"]; !ok || val == nil {
-		log.Debug().Err(err).Msg("Failed to extract email from claims.")
+		log.Debug().Msg("Failed to extract email from claims.")
 		return user, fmt.Errorf("unable to extract email, please check the scopes enabled for your app. It needs `email`, `name` scopes")
 	} else {
-		email := val.(string)
+		email, _ := val.(string)
 		user.Email = &email
 	}
 
-	if val, ok := claims["name"]; ok {
-		nameData := val.(map[string]interface{})
-		if nameVal, ok := nameData["firstName"]; ok {
-			givenName := nameVal.(string)
-			user.GivenName = &givenName
-		}
-
-		if nameVal, ok := nameData["lastName"]; ok {
-			familyName := nameVal.(string)
-			user.FamilyName = &familyName
-		}
-	}
 	user.GivenName = &user_.Name.FirstName
 	user.FamilyName = &user_.Name.LastName
 
-	return user, err
+	return user, nil
 }
 
 func (h *httpProvider) processDiscordUserInfo(ctx *gin.Context, code string) (*schemas.User, error) {
@@ -773,7 +851,9 @@ func (h *httpProvider) processDiscordUserInfo(ctx *gin.Context, code string) (*s
 		log.Debug().Err(err).Msg("Username is not in expected format or missing in user data")
 		return nil, fmt.Errorf("username is not in expected format or missing in user data")
 	}
-	profilePicture := fmt.Sprintf("https://cdn.discordapp.com/avatars/%s/%s.png", userRawData["id"].(string), userRawData["avatar"].(string))
+	discordID, _ := userRawData["id"].(string)
+	avatar, _ := userRawData["avatar"].(string)
+	profilePicture := fmt.Sprintf("https://cdn.discordapp.com/avatars/%s/%s.png", discordID, avatar)
 
 	user := &schemas.User{
 		GivenName: &firstName,
@@ -826,25 +906,32 @@ func (h *httpProvider) processTwitterUserInfo(ctx *gin.Context, code, verifier s
 	}
 
 	responseRawData := make(map[string]interface{})
-	json.Unmarshal(body, &responseRawData)
+	if err := json.Unmarshal(body, &responseRawData); err != nil {
+		log.Debug().Err(err).Msg("Failed to unmarshal twitter user info")
+		return nil, fmt.Errorf("failed to parse twitter user info: %s", err.Error())
+	}
 
-	userRawData := responseRawData["data"].(map[string]interface{})
+	userRawData, ok := responseRawData["data"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("twitter response missing data field")
+	}
 
-	// log.Info(userRawData)
 	// Twitter API does not return E-Mail adresses by default. For that case special privileges have
 	// to be granted on a per-App basis. See https://developer.twitter.com/en/docs/twitter-api/v1/accounts-and-users/manage-account-settings/api-reference/get-account-verify_credentials
 
 	// Currently Twitter API only provides the full name of a user. To fill givenName and familyName
 	// the full name will be split at the first whitespace. This approach will not be valid for all name combinations
-	nameArr := strings.SplitAfterN(userRawData["name"].(string), " ", 2)
-
-	firstName := nameArr[0]
+	firstName := ""
 	lastName := ""
-	if len(nameArr) == 2 {
-		lastName = nameArr[1]
+	if name, ok := userRawData["name"].(string); ok {
+		nameArr := strings.SplitAfterN(name, " ", 2)
+		firstName = nameArr[0]
+		if len(nameArr) == 2 {
+			lastName = nameArr[1]
+		}
 	}
-	nickname := userRawData["username"].(string)
-	profilePicture := userRawData["profile_image_url"].(string)
+	nickname, _ := userRawData["username"].(string)
+	profilePicture, _ := userRawData["profile_image_url"].(string)
 
 	user := &schemas.User{
 		GivenName:  &firstName,
@@ -986,22 +1073,27 @@ func (h *httpProvider) processRobloxUserInfo(ctx *gin.Context, code, verifier st
 	}
 
 	userRawData := make(map[string]interface{})
-	json.Unmarshal(body, &userRawData)
-
-	// log.Info(userRawData)
-	nameArr := strings.SplitAfterN(userRawData["name"].(string), " ", 2)
-	firstName := nameArr[0]
-	lastName := ""
-	if len(nameArr) == 2 {
-		lastName = nameArr[1]
+	if err := json.Unmarshal(body, &userRawData); err != nil {
+		log.Debug().Err(err).Msg("Failed to unmarshal roblox user info")
+		return nil, fmt.Errorf("failed to parse roblox user info: %s", err.Error())
 	}
-	nickname := userRawData["nickname"].(string)
-	profilePicture := userRawData["picture"].(string)
+
+	firstName := ""
+	lastName := ""
+	if name, ok := userRawData["name"].(string); ok {
+		nameArr := strings.SplitAfterN(name, " ", 2)
+		firstName = nameArr[0]
+		if len(nameArr) == 2 {
+			lastName = nameArr[1]
+		}
+	}
+	nickname, _ := userRawData["nickname"].(string)
+	profilePicture, _ := userRawData["picture"].(string)
 	email := ""
-	if val, ok := userRawData["email"]; ok {
-		email = val.(string)
-	} else {
-		email = userRawData["sub"].(string)
+	if val, ok := userRawData["email"].(string); ok && val != "" {
+		email = val
+	} else if sub, ok := userRawData["sub"].(string); ok {
+		email = sub
 	}
 	user := &schemas.User{
 		GivenName:  &firstName,
@@ -1012,4 +1104,22 @@ func (h *httpProvider) processRobloxUserInfo(ctx *gin.Context, code, verifier st
 	}
 
 	return user, nil
+}
+
+// parseScopes parses a scope string into a slice of individual scope values.
+// Commas take precedence over spaces as delimiter. If neither delimiter is
+// present, the entire string is returned as a single-element slice.
+// RFC 6749 §3.3 defines space as the standard delimiter; commas are accepted
+// as a convenience.
+func parseScopes(scopeString string) []string {
+	if scopeString == "" {
+		return []string{}
+	}
+	if strings.Contains(scopeString, ",") {
+		return strings.Split(scopeString, ",")
+	}
+	if strings.Contains(scopeString, " ") {
+		return strings.Split(scopeString, " ")
+	}
+	return []string{scopeString}
 }

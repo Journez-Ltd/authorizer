@@ -72,6 +72,21 @@ func (g *graphqlProvider) TestEndpoint(ctx context.Context, params *model.TestEn
 		return nil, err
 	}
 
+	// SSRF protection: resolve the host once and pin the dialer to the validated
+	// IP so http.Client cannot be tricked into re-resolving (DNS rebinding TOCTOU).
+	// Skipped only when tests explicitly set SkipTestEndpointSSRFValidation.
+	skipSSRF := g.Config.Env == constants.TestEnv && g.Config.SkipTestEndpointSSRFValidation
+	var client *http.Client
+	if skipSSRF {
+		client = &http.Client{Timeout: time.Second * 30}
+	} else {
+		client, err = validators.SafeHTTPClient(ctx, params.Endpoint, time.Second*30)
+		if err != nil {
+			log.Debug().Err(err).Str("endpoint", params.Endpoint).Msg("endpoint URL rejected by SSRF filter")
+			return nil, fmt.Errorf("invalid endpoint: %w", err)
+		}
+	}
+
 	req, err := http.NewRequest("POST", params.Endpoint, bytes.NewBuffer(requestBody))
 	if err != nil {
 		log.Debug().Err(err).Msg("error creating post request")
@@ -79,9 +94,8 @@ func (g *graphqlProvider) TestEndpoint(ctx context.Context, params *model.TestEn
 	}
 	req.Header.Set("Content-Type", "application/json")
 	for key, val := range params.Headers {
-		req.Header.Set(key, val.(string))
+		req.Header.Set(key, headerValueString(val))
 	}
-	client := &http.Client{Timeout: time.Second * 30}
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Debug().Err(err).Msg("error making request")
@@ -100,4 +114,15 @@ func (g *graphqlProvider) TestEndpoint(ctx context.Context, params *model.TestEn
 		HTTPStatus: &statusCode,
 		Response:   refs.NewStringRef(string(body)),
 	}, nil
+}
+
+// headerValueString coerces GraphQL JSON header values to strings without panicking.
+func headerValueString(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	if v == nil {
+		return ""
+	}
+	return fmt.Sprint(v)
 }

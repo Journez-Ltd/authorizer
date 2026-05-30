@@ -9,6 +9,9 @@ import (
 )
 
 // Note: any change here should be reflected in providers/casandra/provider.go as it does not have model support in collection creation
+//
+// Nullable pointers (*int64, *string, etc.): do not add json/bson omitempty to fields that must
+// clear stored values when nil — see docs/storage-optional-null-fields.md.
 
 // User model for db
 type User struct {
@@ -17,7 +20,7 @@ type User struct {
 
 	Email                    *string `gorm:"index" json:"email" bson:"email" cql:"email" dynamo:"email" index:"email,hash"`
 	EmailVerifiedAt          *int64  `json:"email_verified_at" bson:"email_verified_at" cql:"email_verified_at" dynamo:"email_verified_at"`
-	Password                 *string `json:"password" bson:"password" cql:"password" dynamo:"password"`
+	Password                 *string `json:"-" bson:"password" cql:"password" dynamo:"password"`
 	SignupMethods            string  `json:"signup_methods" bson:"signup_methods" cql:"signup_methods" dynamo:"signup_methods"`
 	GivenName                *string `json:"given_name" bson:"given_name" cql:"given_name" dynamo:"given_name"`
 	FamilyName               *string `json:"family_name" bson:"family_name" cql:"family_name" dynamo:"family_name"`

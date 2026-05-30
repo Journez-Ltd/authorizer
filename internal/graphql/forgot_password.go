@@ -8,9 +8,12 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
 	"github.com/authorizerdev/authorizer/internal/constants"
 	"github.com/authorizerdev/authorizer/internal/cookie"
+	"github.com/authorizerdev/authorizer/internal/crypto"
 	"github.com/authorizerdev/authorizer/internal/graph/model"
+	"github.com/authorizerdev/authorizer/internal/metrics"
 	"github.com/authorizerdev/authorizer/internal/parsers"
 	"github.com/authorizerdev/authorizer/internal/refs"
 	"github.com/authorizerdev/authorizer/internal/storage/schemas"
@@ -59,7 +62,14 @@ func (g *graphqlProvider) ForgotPassword(ctx context.Context, params *model.Forg
 		log.Debug().Err(err).Msg("Failed to get user by phone number")
 	}
 	if err != nil {
-		return nil, fmt.Errorf(`bad user credentials`)
+		// Do not reveal whether the account exists. Return the same generic
+		// "we sent the email if it exists" response that a successful path
+		// returns. The real reason is logged at debug level.
+		log.Debug().Err(err).Str("reason", "user_not_found").Msg("forgot password silently dropped")
+		metrics.RecordAuthEvent(metrics.EventForgotPwd, metrics.StatusFailure)
+		return &model.ForgotPasswordResponse{
+			Message: `If an account exists for this email, a password reset link has been sent. Please check your inbox. If you don't receive it within a few minutes, double-check the email address for typos.`,
+		}, nil
 	}
 	hostname := parsers.GetHost(gc)
 	_, nonceHash, err := utils.GenerateNonce()
@@ -68,15 +78,18 @@ func (g *graphqlProvider) ForgotPassword(ctx context.Context, params *model.Forg
 		return nil, err
 	}
 	if user.RevokedTimestamp != nil {
-		log.Debug().Msg("User access has been revoked")
-		return nil, fmt.Errorf(`user access has been revoked`)
+		log.Debug().Str("reason", "account_revoked").Msg("forgot password silently dropped")
+		metrics.RecordAuthEvent(metrics.EventForgotPwd, metrics.StatusFailure)
+		return &model.ForgotPasswordResponse{
+			Message: `If an account exists for this email, a password reset link has been sent. Please check your inbox. If you don't receive it within a few minutes, double-check the email address for typos.`,
+		}, nil
 	}
 	if isEmailLogin {
 		redirectURI := ""
 		// give higher preference to params redirect uri
 		if strings.TrimSpace(refs.StringValue(params.RedirectURI)) != "" {
 			redirectURI = refs.StringValue(params.RedirectURI)
-			if !validators.IsValidOrigin(redirectURI, g.Config.AllowedOrigins) {
+			if !validators.IsValidRedirectURI(redirectURI, g.Config.AllowedOrigins, hostname) {
 				log.Debug().Msg("Invalid redirect URI")
 				return nil, fmt.Errorf("invalid redirect URI")
 			}
@@ -116,17 +129,33 @@ func (g *graphqlProvider) ForgotPassword(ctx context.Context, params *model.Forg
 			"organization":     utils.GetOrganization(g.Config),
 			"verification_url": utils.GetForgotPasswordURL(verificationToken, redirectURI),
 		})
+		g.AuditProvider.LogEvent(audit.Event{
+			Action:       constants.AuditForgotPasswordEvent,
+			ActorID:      user.ID,
+			ActorType:    constants.AuditActorTypeUser,
+			ActorEmail:   email,
+			ResourceType: constants.AuditResourceTypeUser,
+			ResourceID:   user.ID,
+			IPAddress:    utils.GetIP(gc.Request),
+			UserAgent:    utils.GetUserAgent(gc.Request),
+		})
+		metrics.RecordAuthEvent(metrics.EventForgotPwd, metrics.StatusSuccess)
 		return &model.ForgotPasswordResponse{
-			Message: `Please check your inbox! We have sent a password reset link.`,
+			Message: `If an account exists for this email, a password reset link has been sent. Please check your inbox. If you don't receive it within a few minutes, double-check the email address for typos.`,
 		}, nil
 	}
 	if isMobileLogin {
 		expiresAt := time.Now().Add(1 * time.Minute).Unix()
-		otp := utils.GenerateOTP()
-		otpData, err := g.StorageProvider.UpsertOTP(ctx, &schemas.OTP{
+		otp, err := utils.GenerateOTP()
+		if err != nil {
+			log.Debug().Err(err).Msg("Failed to generate OTP")
+			return nil, err
+		}
+		// Store the HMAC digest; otp (plaintext local) is sent via SMS below.
+		_, err = g.StorageProvider.UpsertOTP(ctx, &schemas.OTP{
 			Email:       refs.StringValue(user.Email),
 			PhoneNumber: refs.StringValue(user.PhoneNumber),
-			Otp:         otp,
+			Otp:         crypto.HashOTP(otp, g.Config.JWTSecret),
 			ExpiresAt:   expiresAt,
 		})
 		if err != nil {
@@ -142,11 +171,22 @@ func (g *graphqlProvider) ForgotPassword(ctx context.Context, params *model.Forg
 		cookie.SetMfaSession(gc, mfaSession, g.Config.AppCookieSecure)
 		smsBody := strings.Builder{}
 		smsBody.WriteString("Your verification code is: ")
-		smsBody.WriteString(otpData.Otp)
+		smsBody.WriteString(otp)
 		if err := g.SMSProvider.SendSMS(phoneNumber, smsBody.String()); err != nil {
 			log.Debug().Err(err).Msg("Failed to send sms")
 			// continue
 		}
+		g.AuditProvider.LogEvent(audit.Event{
+			Action:       constants.AuditForgotPasswordEvent,
+			ActorID:      user.ID,
+			ActorType:    constants.AuditActorTypeUser,
+			ActorEmail:   refs.StringValue(user.Email),
+			ResourceType: constants.AuditResourceTypeUser,
+			ResourceID:   user.ID,
+			IPAddress:    utils.GetIP(gc.Request),
+			UserAgent:    utils.GetUserAgent(gc.Request),
+		})
+		metrics.RecordAuthEvent(metrics.EventForgotPwd, metrics.StatusSuccess)
 		return &model.ForgotPasswordResponse{
 			Message:                   "Please enter the OTP sent to your phone number and change your password.",
 			ShouldShowMobileOtpScreen: refs.NewBoolRef(true),

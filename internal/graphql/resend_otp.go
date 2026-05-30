@@ -9,8 +9,10 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
 	"github.com/authorizerdev/authorizer/internal/constants"
 	"github.com/authorizerdev/authorizer/internal/cookie"
+	"github.com/authorizerdev/authorizer/internal/crypto"
 	"github.com/authorizerdev/authorizer/internal/graph/model"
 	"github.com/authorizerdev/authorizer/internal/refs"
 	"github.com/authorizerdev/authorizer/internal/storage/schemas"
@@ -43,25 +45,35 @@ func (g *graphqlProvider) ResendOTP(ctx context.Context, params *model.ResendOTP
 		user, err = g.StorageProvider.GetUserByEmail(ctx, email)
 		if err != nil {
 			log.Debug().Err(err).Msg("Failed to get user by email")
-			return nil, fmt.Errorf(`user with this email/phone not found`)
+			return &model.Response{
+				Message: "If an account exists, an OTP has been sent",
+			}, nil
 		}
 	} else {
 		isSMSServiceEnabled = g.Config.IsSMSServiceEnabled
 		if !isSMSServiceEnabled {
 			log.Debug().Msg("SMS service not enabled")
-			return nil, errors.New("email service not enabled")
+			return nil, errors.New("SMS service not enabled")
 		}
 		user, err = g.StorageProvider.GetUserByPhoneNumber(ctx, phoneNumber)
 		if err != nil {
 			log.Debug().Err(err).Msg("Failed to get user by phone number")
-			return nil, fmt.Errorf(`user with this email/phone not found`)
+			return &model.Response{
+				Message: "If an account exists, an OTP has been sent",
+			}, nil
 		}
 	}
 	if user.RevokedTimestamp != nil {
 		log.Debug().Msg("User access has been revoked")
-		return nil, fmt.Errorf(`user access has been revoked`)
+		return &model.Response{
+			Message: "If an account exists, an OTP has been sent",
+		}, nil
 	}
 
+	// Block OTP resend when MFA is disabled and both email & phone are
+	// already verified — there is no pending verification that needs an OTP.
+	// When MFA IS enabled, or when either email/phone is still unverified,
+	// OTP resend is allowed (for MFA challenges or pending verification).
 	if !refs.BoolValue(user.IsMultiFactorAuthEnabled) && user.EmailVerifiedAt != nil && user.PhoneNumberVerifiedAt != nil {
 		log.Debug().Msg("Multi factor authentication not enabled")
 		return nil, fmt.Errorf(`multi factor authentication not enabled`)
@@ -76,11 +88,15 @@ func (g *graphqlProvider) ResendOTP(ctx context.Context, params *model.ResendOTP
 	// get otp by email or phone number
 	var otpData *schemas.OTP
 	if email != "" {
-		otpData, err = g.StorageProvider.GetOTPByEmail(ctx, refs.StringValue(params.Email))
-		log.Debug().Msg("Failed to get otp for given email")
+		otpData, err = g.StorageProvider.GetOTPByEmail(ctx, email)
+		if err != nil {
+			log.Debug().Err(err).Msg("Failed to get otp for given email")
+		}
 	} else {
-		otpData, err = g.StorageProvider.GetOTPByPhoneNumber(ctx, refs.StringValue(params.PhoneNumber))
-		log.Debug().Msg("Failed to get otp for given phone number")
+		otpData, err = g.StorageProvider.GetOTPByPhoneNumber(ctx, phoneNumber)
+		if err != nil {
+			log.Debug().Err(err).Msg("Failed to get otp for given phone number")
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -93,17 +109,24 @@ func (g *graphqlProvider) ResendOTP(ctx context.Context, params *model.ResendOTP
 	}
 	// If multi factor authentication is enabled and we need to generate OTP for mail / sms based MFA
 	generateOTP := func(expiresAt int64) (*schemas.OTP, error) {
-		otp := utils.GenerateOTP()
+		otp, err := utils.GenerateOTP()
+		if err != nil {
+			log.Debug().Err(err).Msg("Failed to generate OTP")
+			return nil, err
+		}
+		// Store HMAC digest; the plaintext is restored on the returned
+		// struct so the caller's email/SMS body can read otpData.Otp.
 		otpData, err := g.StorageProvider.UpsertOTP(ctx, &schemas.OTP{
 			Email:       refs.StringValue(user.Email),
 			PhoneNumber: refs.StringValue(user.PhoneNumber),
-			Otp:         otp,
+			Otp:         crypto.HashOTP(otp, g.Config.JWTSecret),
 			ExpiresAt:   expiresAt,
 		})
 		if err != nil {
 			log.Debug().Msg("Failed to upsert otp")
 			return nil, err
 		}
+		otpData.Otp = otp
 		return otpData, nil
 	}
 	setOTPMFaSession := func(expiresAt int64) error {
@@ -149,6 +172,16 @@ func (g *graphqlProvider) ResendOTP(ctx context.Context, params *model.ResendOTP
 			}
 		}()
 	}
+	g.AuditProvider.LogEvent(audit.Event{
+		Action:       constants.AuditOTPResentEvent,
+		ActorID:      user.ID,
+		ActorType:    constants.AuditActorTypeUser,
+		ActorEmail:   refs.StringValue(user.Email),
+		ResourceType: constants.AuditResourceTypeUser,
+		ResourceID:   user.ID,
+		IPAddress:    utils.GetIP(gc.Request),
+		UserAgent:    utils.GetUserAgent(gc.Request),
+	})
 	log.Info().Msg("OTP has been sent")
 	return &model.Response{
 		Message: `OTP has been sent. Please check your inbox`,

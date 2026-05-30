@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
 	"github.com/authorizerdev/authorizer/internal/constants"
 	"github.com/authorizerdev/authorizer/internal/graph/model"
 	"github.com/authorizerdev/authorizer/internal/parsers"
@@ -89,7 +90,7 @@ func (g *graphqlProvider) InviteMembers(ctx context.Context, params *model.Invit
 		redirectURL := appURL
 		if params.RedirectURI != nil {
 			redirectURL = *params.RedirectURI
-			if !validators.IsValidOrigin(redirectURL, g.Config.AllowedOrigins) {
+			if !validators.IsValidRedirectURI(redirectURL, g.Config.AllowedOrigins, hostname) {
 				log.Debug().Msg("Invalid redirect URI")
 				return nil, fmt.Errorf("invalid redirect URI")
 			}
@@ -169,6 +170,14 @@ func (g *graphqlProvider) InviteMembers(ctx context.Context, params *model.Invit
 			ID:    user.ID,
 		})
 	}
+
+	g.AuditProvider.LogEvent(audit.Event{
+		Action:       constants.AuditAdminInviteSentEvent,
+		ActorType:    constants.AuditActorTypeAdmin,
+		ResourceType: constants.AuditResourceTypeUser,
+		IPAddress:    utils.GetIP(gc.Request),
+		UserAgent:    utils.GetUserAgent(gc.Request),
+	})
 
 	return &model.InviteMembersResponse{
 		Message: fmt.Sprintf("%d user(s) invited successfully.", len(newEmails)),

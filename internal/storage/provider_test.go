@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,13 +20,34 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var dbTypes = []string{
+// allDBTypes is the full list of database types supported for storage tests.
+var allDBTypes = []string{
 	constants.DbTypePostgres,
+	constants.DbTypeSqlite,
 	constants.DbTypeMongoDB,
 	constants.DbTypeArangoDB,
 	constants.DbTypeScyllaDB,
 	constants.DbTypeCouchbaseDB,
 	constants.DbTypeDynamoDB,
+}
+
+// getTestDBTypes returns the list of database types to test against.
+// Reads from TEST_DBS env var (comma-separated). Defaults to allDBTypes if not set.
+func getTestDBTypes() []string {
+	testDBsEnv := os.Getenv("TEST_DBS")
+	if testDBsEnv == "" {
+		return allDBTypes
+	}
+
+	parts := strings.Split(testDBsEnv, ",")
+	var result []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result
 }
 
 func getTestDBConfig(dbType string) *config.Config {
@@ -39,6 +61,8 @@ func getTestDBConfig(dbType string) *config.Config {
 	switch dbType {
 	case constants.DbTypePostgres:
 		cfg.DatabaseURL = "postgres://postgres:postgres@localhost:5434/postgres"
+	case constants.DbTypeSqlite:
+		cfg.DatabaseURL = "test.db"
 	case constants.DbTypeMongoDB:
 		cfg.DatabaseURL = "mongodb://localhost:27017"
 	case constants.DbTypeArangoDB:
@@ -50,7 +74,8 @@ func getTestDBConfig(dbType string) *config.Config {
 		// Allow extra time for Couchbase container to become ready in tests
 		cfg.CouchBaseWaitTimeout = 120
 	case constants.DbTypeDynamoDB:
-		cfg.DatabaseURL = "http://0.0.0.0:8000"
+		// Must be a client-routable host (not bind address 0.0.0.0); matches integration_tests getDBURL.
+		cfg.DatabaseURL = "http://127.0.0.1:8000"
 	}
 
 	return cfg
@@ -59,7 +84,7 @@ func getTestDBConfig(dbType string) *config.Config {
 func TestStorageProvider(t *testing.T) {
 	// Initialize logger
 	logger := zerolog.New(zerolog.NewTestWriter(t)).With().Timestamp().Logger()
-	for _, dbType := range dbTypes {
+	for _, dbType := range getTestDBTypes() {
 		t.Run("should test storage provider for "+dbType, func(t *testing.T) {
 			if dbType == constants.DbTypeDynamoDB {
 				os.Unsetenv("AWS_ACCESS_KEY_ID")
@@ -87,6 +112,11 @@ func TestStorageProvider(t *testing.T) {
 			}
 			require.NoError(t, err)
 			require.NotNil(t, provider)
+
+			t.Run("HealthCheck", func(t *testing.T) {
+				err := provider.HealthCheck(ctx)
+				assert.NoError(t, err, "HealthCheck should succeed when the test database is reachable")
+			})
 
 			t.Run("Authenticator Operations", func(t *testing.T) {
 				testAuthenticatorOperations(t, ctx, provider)
@@ -126,6 +156,10 @@ func TestStorageProvider(t *testing.T) {
 
 			t.Run("OAuth State Operations", func(t *testing.T) {
 				testOAuthStateOperations(t, ctx, provider)
+			})
+
+			t.Run("Audit Log Operations", func(t *testing.T) {
+				testAuditLogOperations(t, ctx, provider)
 			})
 
 		})
@@ -672,6 +706,101 @@ func testMFASessionOperations(t *testing.T, ctx context.Context, provider Provid
 	// Verify expired session is cleaned
 	_, err = provider.GetMFASessionByUserIDAndKey(ctx, "auth_provider:expired_user", "expired_session_key")
 	assert.Error(t, err)
+}
+
+func testAuditLogOperations(t *testing.T, ctx context.Context, provider Provider) {
+	t.Run("add and list", func(t *testing.T) {
+		auditLog := &schemas.AuditLog{
+			ActorID:      uuid.New().String(),
+			ActorType:    constants.AuditActorTypeUser,
+			ActorEmail:   "test_" + uuid.New().String() + "@example.com",
+			Action:       constants.AuditLoginSuccessEvent,
+			ResourceType: constants.AuditResourceTypeSession,
+			ResourceID:   uuid.New().String(),
+			IPAddress:    "127.0.0.1",
+			UserAgent:    "provider-test-agent",
+		}
+		err := provider.AddAuditLog(ctx, auditLog)
+		require.NoError(t, err)
+		assert.NotEmpty(t, auditLog.ID)
+		assert.NotZero(t, auditLog.CreatedAt)
+
+		pagination := &model.Pagination{Limit: 10, Offset: 0}
+		logs, pag, err := provider.ListAuditLogs(ctx, pagination, map[string]interface{}{})
+		require.NoError(t, err)
+		require.NotNil(t, pag)
+		assert.GreaterOrEqual(t, len(logs), 1)
+	})
+
+	t.Run("filter by action", func(t *testing.T) {
+		uniqueAction := "provider_test_action_" + uuid.New().String()[:8]
+		auditLog := &schemas.AuditLog{
+			ActorID:      uuid.New().String(),
+			ActorType:    constants.AuditActorTypeUser,
+			ActorEmail:   "filter_" + uuid.New().String() + "@example.com",
+			Action:       uniqueAction,
+			ResourceType: constants.AuditResourceTypeUser,
+		}
+		require.NoError(t, provider.AddAuditLog(ctx, auditLog))
+
+		pagination := &model.Pagination{Limit: 10, Offset: 0}
+		logs, _, err := provider.ListAuditLogs(ctx, pagination, map[string]interface{}{
+			"action": uniqueAction,
+		})
+		require.NoError(t, err)
+		require.Len(t, logs, 1)
+		assert.Equal(t, uniqueAction, logs[0].Action)
+	})
+
+	t.Run("filter by actor_id", func(t *testing.T) {
+		actorID := uuid.New().String()
+		auditLog := &schemas.AuditLog{
+			ActorID:      actorID,
+			ActorType:    constants.AuditActorTypeAdmin,
+			ActorEmail:   "admin_" + uuid.New().String() + "@example.com",
+			Action:       constants.AuditAdminUserUpdatedEvent,
+			ResourceType: constants.AuditResourceTypeUser,
+		}
+		require.NoError(t, provider.AddAuditLog(ctx, auditLog))
+
+		pagination := &model.Pagination{Limit: 10, Offset: 0}
+		logs, _, err := provider.ListAuditLogs(ctx, pagination, map[string]interface{}{
+			"actor_id": actorID,
+		})
+		require.NoError(t, err)
+		require.Len(t, logs, 1)
+		assert.Equal(t, actorID, logs[0].ActorID)
+	})
+
+	t.Run("list does not mutate caller pagination pointer", func(t *testing.T) {
+		pagination := &model.Pagination{Limit: 10, Offset: 0}
+		_, returnedPag, err := provider.ListAuditLogs(ctx, pagination, map[string]interface{}{})
+		require.NoError(t, err)
+		assert.NotSame(t, pagination, returnedPag, "should return a new pagination object")
+	})
+
+	t.Run("delete before created_at", func(t *testing.T) {
+		uniqueAction := "provider_cleanup_" + uuid.New().String()[:8]
+		oldLog := &schemas.AuditLog{
+			ActorID:      uuid.New().String(),
+			ActorType:    constants.AuditActorTypeUser,
+			ActorEmail:   "system_" + uuid.New().String() + "@example.com",
+			Action:       uniqueAction,
+			ResourceType: constants.AuditResourceTypeUser,
+			CreatedAt:    time.Now().Add(-24 * time.Hour).Unix(),
+		}
+		require.NoError(t, provider.AddAuditLog(ctx, oldLog))
+
+		before := time.Now().Add(-1 * time.Hour).Unix()
+		require.NoError(t, provider.DeleteAuditLogsBefore(ctx, before))
+
+		pagination := &model.Pagination{Limit: 10, Offset: 0}
+		logs, _, err := provider.ListAuditLogs(ctx, pagination, map[string]interface{}{
+			"action": uniqueAction,
+		})
+		require.NoError(t, err)
+		assert.Empty(t, logs)
+	})
 }
 
 func testOAuthStateOperations(t *testing.T, ctx context.Context, provider Provider) {

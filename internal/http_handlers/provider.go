@@ -4,12 +4,14 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/rs/zerolog"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
 	"github.com/authorizerdev/authorizer/internal/authenticators"
 	"github.com/authorizerdev/authorizer/internal/config"
 	"github.com/authorizerdev/authorizer/internal/email"
 	"github.com/authorizerdev/authorizer/internal/events"
 	"github.com/authorizerdev/authorizer/internal/memory_store"
 	"github.com/authorizerdev/authorizer/internal/oauth"
+	"github.com/authorizerdev/authorizer/internal/rate_limit"
 	"github.com/authorizerdev/authorizer/internal/sms"
 	"github.com/authorizerdev/authorizer/internal/storage"
 	"github.com/authorizerdev/authorizer/internal/token"
@@ -20,6 +22,8 @@ type Dependencies struct {
 	Log *zerolog.Logger
 
 	// Providers for various services
+	// AuditProvider is used to log audit events
+	AuditProvider audit.Provider
 	// AuthenticatorProvider is used to register authenticators like totp (Google Authenticator)
 	AuthenticatorProvider authenticators.Provider
 	// EmailProvider is used to send emails
@@ -36,6 +40,8 @@ type Dependencies struct {
 	TokenProvider token.Provider
 	// OAuthProvider is used to register oauth providers
 	OAuthProvider oauth.Provider
+	// RateLimitProvider is used for per-IP rate limiting
+	RateLimitProvider rate_limit.Provider
 }
 
 // New constructs a new http provider with given arguments
@@ -67,8 +73,12 @@ type Provider interface {
 	DashboardHandler() gin.HandlerFunc
 	// GraphqlHandler is the main handler that handels all the graphql requests
 	GraphqlHandler() gin.HandlerFunc
-	// HealthHandler is the main handler that handels all the health requests
+	// HealthHandler is the handler for the /healthz liveness probe
 	HealthHandler() gin.HandlerFunc
+	// ReadyHandler is the handler for the /readyz readiness probe
+	ReadyHandler() gin.HandlerFunc
+	// IntrospectHandler is the main handler for RFC 7662 Token Introspection
+	IntrospectHandler() gin.HandlerFunc
 	// JWKsHandler is the main handler that handels all the jwks requests
 	JWKsHandler() gin.HandlerFunc
 	// LogoutHandler is the main handler that handels all the logout requests
@@ -98,6 +108,16 @@ type Provider interface {
 	ContextMiddleware() gin.HandlerFunc
 	// CORSMiddleware is the middleware that adds the cors headers to the response
 	CORSMiddleware() gin.HandlerFunc
+	// CSRFMiddleware protects against CSRF on state-changing requests
+	CSRFMiddleware() gin.HandlerFunc
 	// LoggerMiddleware is the middleware that logs the request
 	LoggerMiddleware() gin.HandlerFunc
+	// RateLimitMiddleware is the middleware that rate limits requests per IP
+	RateLimitMiddleware() gin.HandlerFunc
+	// MetricsMiddleware records HTTP request count and duration for prometheus.
+	MetricsMiddleware() gin.HandlerFunc
+	// MetricsHandler serves the Prometheus metrics scrape endpoint.
+	MetricsHandler() gin.HandlerFunc
+	// SecurityHeadersMiddleware sets standard security headers on every response.
+	SecurityHeadersMiddleware() gin.HandlerFunc
 }

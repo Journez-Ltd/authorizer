@@ -34,10 +34,12 @@ Returns metadata about the Authorizer instance so clients can auto-configure the
 | `revocation_endpoint` | URL for `/oauth/revoke` |
 | `end_session_endpoint` | URL for `/logout` |
 | `response_types_supported` | `["code", "token", "id_token"]` |
-| `grant_types_supported` | `["authorization_code", "refresh_token"]` |
+| `grant_types_supported` | `["authorization_code", "refresh_token", "implicit"]` |
 | `scopes_supported` | `["openid", "email", "profile", "offline_access"]` |
 | `code_challenge_methods_supported` | `["S256"]` |
 | `token_endpoint_auth_methods_supported` | `["client_secret_basic", "client_secret_post"]` |
+
+> **Phase 1 conformance note:** `grant_types_supported` now includes `implicit` to honestly reflect that `/authorize` accepts `response_type=token` and `response_type=id_token`. The previously advertised `registration_endpoint` field has been removed because it pointed to the signup UI, not an RFC 7591 dynamic client registration endpoint; it will return when RFC 7591 is implemented.
 
 ### Usage
 
@@ -67,8 +69,8 @@ Initiates the OAuth 2.0 authorization flow. Supports Authorization Code (with PK
 | `redirect_uri` | No | Where to redirect after auth (defaults to `/app`) |
 | `scope` | No | Space-separated scopes (default: `openid profile email`) |
 | `response_mode` | No | `query`, `fragment`, `form_post`, or `web_message` |
-| `code_challenge` | Required for `code` | PKCE S256 challenge: `BASE64URL(SHA256(code_verifier))` |
-| `code_challenge_method` | No | Only `S256` is supported (defaults to `S256`) |
+| `code_challenge` | Recommended | PKCE challenge. Required for public clients; confidential clients may use `client_secret` instead |
+| `code_challenge_method` | No | `S256` (default) or `plain` per RFC 7636 |
 | `nonce` | Recommended | Binds ID token to session; REQUIRED for implicit flows per OIDC |
 | `screen_hint` | No | Set to `signup` to show the signup page |
 
@@ -101,6 +103,8 @@ GET /authorize?
 ```
 
 **Success response:** Redirects to `redirect_uri#access_token=...&id_token=...&token_type=Bearer&state=...`
+
+> **Phase 1 conformance note:** ID tokens issued from any flow now compute `at_hash` correctly as `base64url(sha256(access_token)[:16])` per OIDC Core §3.2.2.10, and echo the request's `nonce` (OIDC Core §2) when one was supplied. Previously the implicit/token branch set `at_hash` to the nonce value.
 
 ---
 
@@ -183,16 +187,41 @@ Standard error codes: `invalid_request`, `invalid_client`, `invalid_grant`, `uns
 
 **Endpoint:** `GET /userinfo`
 
-**Specs:** [OIDC Core Section 5.3](https://openid.net/specs/openid-connect-core-1_0.html#UserInfo) | [RFC 6750 (Bearer Token)](https://www.rfc-editor.org/rfc/rfc6750)
+**Specs:** [OIDC Core Section 5.3](https://openid.net/specs/openid-connect-core-1_0.html#UserInfo) | [OIDC Core Section 5.4 (Requesting Claims using Scope Values)](https://openid.net/specs/openid-connect-core-1_0.html#ScopeClaims) | [RFC 6750 (Bearer Token)](https://www.rfc-editor.org/rfc/rfc6750)
 
-Returns claims about the authenticated end-user.
+Returns claims about the authenticated end-user, filtered by the scopes encoded in the access token.
 
 ```bash
 curl -H "Authorization: Bearer ACCESS_TOKEN" \
   https://your-authorizer.example/userinfo
 ```
 
-### Success Response
+### Scope → claim mapping
+
+Per OIDC Core §5.4, the response always includes `sub` plus only the claims permitted by the standard scope groups present on the access token. Clients must request the scopes they actually consume.
+
+| Scope     | Claims returned in addition to `sub`                                                                                          |
+|-----------|-------------------------------------------------------------------------------------------------------------------------------|
+| `profile` | `name`, `family_name`, `given_name`, `middle_name`, `nickname`, `preferred_username`, `profile`, `picture`, `website`, `gender`, `birthdate`, `zoneinfo`, `locale`, `updated_at` |
+| `email`   | `email`, `email_verified`                                                                                                     |
+| `phone`   | `phone_number`, `phone_number_verified`                                                                                       |
+| `address` | `address`                                                                                                                     |
+
+Claim keys belonging to a granted scope group are always present in the response. If the underlying user has no value for a specific claim, the key is emitted with JSON `null` — explicitly permitted by OIDC Core §5.3.2 — so callers can rely on a stable response schema.
+
+### Example responses
+
+Requesting `openid email`:
+
+```json
+{
+  "sub": "user-uuid",
+  "email": "user@example.com",
+  "email_verified": true
+}
+```
+
+Requesting `openid profile email`:
 
 ```json
 {
@@ -201,12 +230,30 @@ curl -H "Authorization: Bearer ACCESS_TOKEN" \
   "email_verified": true,
   "given_name": "Jane",
   "family_name": "Doe",
+  "nickname": null,
+  "preferred_username": "user@example.com",
   "picture": "https://example.com/photo.jpg",
-  "roles": "user"
+  "name": null,
+  "middle_name": null,
+  "profile": null,
+  "website": null,
+  "gender": null,
+  "birthdate": null,
+  "zoneinfo": null,
+  "locale": null,
+  "updated_at": 1712486400
 }
 ```
 
-The `sub` claim is always returned per OIDC Core Section 5.3.2.
+Requesting only `openid`:
+
+```json
+{
+  "sub": "user-uuid"
+}
+```
+
+The `sub` claim is always returned per OIDC Core §5.3.2.
 
 ### Error Response (RFC 6750 Section 3)
 
@@ -345,7 +392,7 @@ grant_type=authorization_code&code=AUTH_CODE&code_verifier=CODE_VERIFIER&client_
 | Standard | Status | Notes |
 |----------|--------|-------|
 | RFC 6749 (OAuth 2.0) | Implemented | Authorization Code + Refresh Token grants |
-| RFC 7636 (PKCE) | Implemented | S256 method required |
+| RFC 7636 (PKCE) | Implemented | S256 (default) and plain methods; optional for confidential clients |
 | RFC 7009 (Token Revocation) | Implemented | Returns 200 for invalid tokens |
 | RFC 6750 (Bearer Token) | Implemented | WWW-Authenticate on 401 |
 | OIDC Core 1.0 | Implemented | ID tokens, UserInfo, nonce |

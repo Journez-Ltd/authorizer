@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
 	"github.com/authorizerdev/authorizer/internal/constants"
 	"github.com/authorizerdev/authorizer/internal/graph/model"
 	"github.com/authorizerdev/authorizer/internal/parsers"
@@ -46,13 +47,13 @@ func (g *graphqlProvider) MagicLinkLogin(ctx context.Context, params *model.Magi
 	}
 
 	// find user with email
-		existingUser, err := g.StorageProvider.GetUserByEmail(ctx, params.Email)
-		if err != nil {
-			isSignupEnabled := g.Config.EnableSignup
-			if !isSignupEnabled {
-				log.Debug().Msg("Signup is disabled")
-				return nil, fmt.Errorf(`signup is disabled for this instance`)
-			}
+	existingUser, err := g.StorageProvider.GetUserByEmail(ctx, params.Email)
+	if err != nil {
+		isSignupEnabled := g.Config.EnableSignup
+		if !isSignupEnabled {
+			log.Debug().Msg("Signup is disabled")
+			return nil, fmt.Errorf(`signup is disabled for this instance`)
+		}
 
 		user.SignupMethods = constants.AuthRecipeMethodMagicLinkLogin
 		// define roles for new user
@@ -80,8 +81,13 @@ func (g *graphqlProvider) MagicLinkLogin(ctx context.Context, params *model.Magi
 		// 		Need to modify roles in this case
 
 		if user.RevokedTimestamp != nil {
-			log.Debug().Msg("User access has been revoked")
-			return nil, fmt.Errorf(`user access has been revoked`)
+			// Do not reveal that the account exists but is revoked. Return the
+			// same generic "magic link sent" response a successful path would
+			// return; the real reason is recorded at debug level.
+			log.Debug().Str("reason", "account_revoked").Msg("magic link silently dropped")
+			return &model.Response{
+				Message: `If an account exists for this email, a magic link has been sent. Please check your inbox. If you don't receive it within a few minutes, double-check the email address for typos.`,
+			}, nil
 		}
 
 		// find the unassigned roles
@@ -149,7 +155,7 @@ func (g *graphqlProvider) MagicLinkLogin(ctx context.Context, params *model.Magi
 		redirectURL := parsers.GetAppURL(gc)
 		if params.RedirectURI != nil {
 			redirectURL = *params.RedirectURI
-			if !validators.IsValidOrigin(redirectURL, g.Config.AllowedOrigins) {
+			if !validators.IsValidRedirectURI(redirectURL, g.Config.AllowedOrigins, hostname) {
 				log.Debug().Msg("Invalid redirect URI")
 				return nil, fmt.Errorf("invalid redirect URI")
 			}
@@ -194,7 +200,18 @@ func (g *graphqlProvider) MagicLinkLogin(ctx context.Context, params *model.Magi
 		})
 	}
 
+	g.AuditProvider.LogEvent(audit.Event{
+		Action:       constants.AuditMagicLinkRequestedEvent,
+		ActorID:      user.ID,
+		ActorType:    constants.AuditActorTypeUser,
+		ActorEmail:   params.Email,
+		ResourceType: constants.AuditResourceTypeUser,
+		ResourceID:   user.ID,
+		IPAddress:    utils.GetIP(gc.Request),
+		UserAgent:    utils.GetUserAgent(gc.Request),
+	})
+
 	return &model.Response{
-		Message: `Magic Link has been sent to your email. Please check your inbox!`,
+		Message: `If an account exists for this email, a magic link has been sent. Please check your inbox. If you don't receive it within a few minutes, double-check the email address for typos.`,
 	}, nil
 }

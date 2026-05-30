@@ -2,6 +2,7 @@ package token
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -20,18 +21,72 @@ import (
 	"github.com/authorizerdev/authorizer/internal/utils"
 )
 
+// reservedClaims are security-critical JWT claims that custom scripts must not override.
+var reservedClaims = map[string]bool{
+	"sub":           true,
+	"iss":           true,
+	"aud":           true,
+	"exp":           true,
+	"iat":           true,
+	"token_type":    true,
+	"roles":         true,
+	"allowed_roles": true,
+	"scope":         true,
+	"nonce":         true,
+	"login_method":  true,
+	"at_hash":       true,
+	"c_hash":        true,
+	"auth_time":     true,
+	"amr":           true,
+	"acr":           true,
+}
+
 // AuthTokenConfig is the configuration for auth token
 type AuthTokenConfig struct {
 	LoginMethod string
 	Nonce       string
-	Code        string
-	AtHash      string
-	CodeHash    string
-	ExpireTime  string
-	User        *schemas.User
-	HostName    string
-	Roles       []string
-	Scope       []string
+	// OIDCNonce is the nonce value from the original OIDC /authorize
+	// request. When set, CreateIDToken uses this for the id_token "nonce"
+	// claim instead of Nonce. This separates the OIDC nonce (client-
+	// provided, echoed back) from the internal session nonce (Nonce).
+	OIDCNonce  string
+	Code       string
+	AtHash     string
+	CodeHash   string
+	ExpireTime string
+	User       *schemas.User
+	HostName   string
+	Roles      []string
+	Scope      []string
+	// AuthTime is the Unix timestamp (seconds) at which the user
+	// authenticated. OIDC Core §2 defines this as the `auth_time` ID
+	// token claim. If zero, CreateIDToken falls back to time.Now() so
+	// existing callers continue to work unchanged (backward compat).
+	AuthTime int64
+}
+
+// loginMethodToAMR maps an internal LoginMethod value to the OIDC Core §2
+// Authentication Methods Reference array. Returns nil (omit the claim)
+// for unknown or empty methods.
+func loginMethodToAMR(method string) []string {
+	switch strings.ToLower(method) {
+	case constants.AuthRecipeMethodBasicAuth, constants.AuthRecipeMethodMobileBasicAuth:
+		return []string{"pwd"}
+	case constants.AuthRecipeMethodMagicLinkLogin, constants.AuthRecipeMethodMobileOTP:
+		return []string{"otp"}
+	case constants.AuthRecipeMethodGoogle,
+		constants.AuthRecipeMethodGithub,
+		constants.AuthRecipeMethodFacebook,
+		constants.AuthRecipeMethodLinkedIn,
+		constants.AuthRecipeMethodApple,
+		constants.AuthRecipeMethodDiscord,
+		constants.AuthRecipeMethodTwitter,
+		constants.AuthRecipeMethodTwitch,
+		constants.AuthRecipeMethodRoblox,
+		constants.AuthRecipeMethodMicrosoft:
+		return []string{"fed"}
+	}
+	return nil
 }
 
 // JWTToken is a struct to hold JWT token and its expiration time
@@ -115,7 +170,7 @@ func (p *provider) CreateAuthToken(gc *gin.Context, cfg *AuthTokenConfig) (*Auth
 
 // CreateSessionToken creates a new session token
 func (p *provider) CreateSessionToken(cfg *AuthTokenConfig) (*SessionData, string, int64, error) {
-	expiresAt := time.Now().AddDate(1, 0, 0).Unix()
+	expiresAt := time.Now().Add(24 * time.Hour).Unix()
 	fingerPrintMap := &SessionData{
 		Nonce:       cfg.Nonce,
 		Roles:       cfg.Roles,
@@ -136,8 +191,13 @@ func (p *provider) CreateSessionToken(cfg *AuthTokenConfig) (*SessionData, strin
 
 // CreateRefreshToken util to create JWT token
 func (p *provider) CreateRefreshToken(cfg *AuthTokenConfig) (string, int64, error) {
-	// expires in 1 year
-	expiryBound := time.Hour * 8760
+	// Lifetime is configurable via --refresh-token-expires-in (seconds).
+	// Default 30 days when unset or non-positive.
+	expirySeconds := p.config.RefreshTokenExpiresIn
+	if expirySeconds <= 0 {
+		expirySeconds = 60 * 60 * 24 * 30
+	}
+	expiryBound := time.Duration(expirySeconds) * time.Second
 	expiresAt := time.Now().Add(expiryBound).Unix()
 	customClaims := jwt.MapClaims{
 		"iss":           cfg.HostName,
@@ -188,29 +248,7 @@ func (p *provider) CreateAccessToken(cfg *AuthTokenConfig) (string, int64, error
 		userBytes, _ := json.Marshal(&resUser)
 		var userMap map[string]interface{}
 		json.Unmarshal(userBytes, &userMap)
-		vm := otto.New()
-		claimBytes, _ := json.Marshal(customClaims)
-		vm.Run(fmt.Sprintf(`
-			var user = %s;
-			var tokenPayload = %s;
-			var customFunction = %s;
-			var functionRes = JSON.stringify(customFunction(user, tokenPayload));
-		`, string(userBytes), string(claimBytes), p.config.CustomAccessTokenScript))
-
-		val, err := vm.Get("functionRes")
-		if err != nil {
-			p.dependencies.Log.Debug().Err(err).Msg("error getting custom access token script")
-		} else {
-			extraPayload := make(map[string]interface{})
-			err = json.Unmarshal([]byte(fmt.Sprintf("%v", val)), &extraPayload)
-			if err != nil {
-				p.dependencies.Log.Debug().Err(err).Msg("error converting accessTokenScript response to map")
-			} else {
-				for k, v := range extraPayload {
-					customClaims[k] = v
-				}
-			}
-		}
+		p.runCustomAccessTokenScript(userBytes, customClaims)
 	}
 	token, err := p.SignJWTToken(customClaims)
 	if err != nil {
@@ -237,8 +275,7 @@ func (p *provider) GetAccessToken(gc *gin.Context) (string, error) {
 		return "", fmt.Errorf(`not a bearer token`)
 	}
 
-	token := strings.TrimPrefix(auth, "Bearer ")
-	return token, nil
+	return authSplit[1], nil
 }
 
 // Function to validate access token for authorizer apis (profile, update_profile)
@@ -254,13 +291,16 @@ func (p *provider) ValidateAccessToken(gc *gin.Context, accessToken string) (map
 		return res, err
 	}
 
-	userID := res["sub"].(string)
-	nonce := res["nonce"].(string)
+	userID, ok := res["sub"].(string)
+	if !ok || userID == "" {
+		return res, fmt.Errorf(`unauthorized: missing sub claim`)
+	}
+	nonce, _ := res["nonce"].(string)
 
-	loginMethod := res["login_method"]
+	loginMethod, _ := res["login_method"].(string)
 	sessionKey := userID
-	if loginMethod != nil && loginMethod != "" {
-		sessionKey = loginMethod.(string) + ":" + userID
+	if loginMethod != "" {
+		sessionKey = loginMethod + ":" + userID
 	}
 
 	token, err := p.dependencies.MemoryStoreProvider.GetUserSession(sessionKey, constants.TokenTypeAccessToken+"_"+nonce)
@@ -269,7 +309,7 @@ func (p *provider) ValidateAccessToken(gc *gin.Context, accessToken string) (map
 		return res, fmt.Errorf(`unauthorized`)
 	}
 
-	if token != accessToken {
+	if subtle.ConstantTimeCompare([]byte(token), []byte(accessToken)) != 1 {
 		p.dependencies.Log.Debug().Msgf("invalid access token: %s, key: %s", err, sessionKey+":"+constants.TokenTypeAccessToken+"_"+nonce)
 		return res, fmt.Errorf(`unauthorized`)
 	}
@@ -303,13 +343,16 @@ func (p *provider) ValidateRefreshToken(gc *gin.Context, refreshToken string) (m
 		return res, err
 	}
 
-	userID := res["sub"].(string)
-	nonce := res["nonce"].(string)
+	userID, ok := res["sub"].(string)
+	if !ok || userID == "" {
+		return res, fmt.Errorf(`unauthorized: missing sub claim`)
+	}
+	nonce, _ := res["nonce"].(string)
 
-	loginMethod := res["login_method"]
+	loginMethod, _ := res["login_method"].(string)
 	sessionKey := userID
-	if loginMethod != nil && loginMethod != "" {
-		sessionKey = loginMethod.(string) + ":" + userID
+	if loginMethod != "" {
+		sessionKey = loginMethod + ":" + userID
 	}
 	token, err := p.dependencies.MemoryStoreProvider.GetUserSession(sessionKey, constants.TokenTypeRefreshToken+"_"+nonce)
 	if nonce == "" || err != nil {
@@ -317,7 +360,7 @@ func (p *provider) ValidateRefreshToken(gc *gin.Context, refreshToken string) (m
 		return res, fmt.Errorf(`unauthorized`)
 	}
 
-	if token != refreshToken {
+	if subtle.ConstantTimeCompare([]byte(token), []byte(refreshToken)) != 1 {
 		p.dependencies.Log.Debug().Msgf("invalid refresh token: %s, key: %s", err, sessionKey+":"+constants.TokenTypeRefreshToken+"_"+nonce)
 		return res, fmt.Errorf(`unauthorized`)
 	}
@@ -364,7 +407,7 @@ func (p *provider) ValidateBrowserSession(gc *gin.Context, encryptedSession stri
 		return nil, fmt.Errorf(`unauthorized`)
 	}
 
-	if encryptedSession != token {
+	if subtle.ConstantTimeCompare([]byte(encryptedSession), []byte(token)) != 1 {
 		return nil, fmt.Errorf(`unauthorized: invalid nonce`)
 	}
 
@@ -375,10 +418,10 @@ func (p *provider) ValidateBrowserSession(gc *gin.Context, encryptedSession stri
 	return &res, nil
 }
 
-// CreateIDToken util to create JWT token, based on
-// user information, roles config and CUSTOM_ACCESS_TOKEN_SCRIPT
-// For response_type (code) / authorization_code grant nonce should be empty
-// for implicit flow it should be present to verify with actual state
+// CreateIDToken util to create the OIDC ID token JWT, based on user
+// information, roles config and CUSTOM_ACCESS_TOKEN_SCRIPT.
+// See the in-function block comment for the at_hash / c_hash / nonce
+// emission rules per OIDC Core §3.1.3.6 / §3.2.2.10.
 func (p *provider) CreateIDToken(cfg *AuthTokenConfig) (string, int64, error) {
 	expiryBound, err := utils.ParseDurationInSeconds(cfg.ExpireTime)
 	if err != nil {
@@ -401,14 +444,52 @@ func (p *provider) CreateIDToken(cfg *AuthTokenConfig) (string, int64, error) {
 		"login_method":        cfg.LoginMethod,
 		p.config.JWTRoleClaim: cfg.Roles,
 	}
-	// split nonce to see if its authorization code grant method
-	if cfg.CodeHash != "" {
+	// OIDC Core §3.1.3.6 / §3.2.2.10:
+	//   at_hash REQUIRED whenever the response includes an access_token
+	//           in the same flow. CreateAuthToken always issues an
+	//           access_token, so cfg.AtHash is always populated.
+	//   c_hash  REQUIRED only in hybrid flows that return both code
+	//           and id_token. Set by the /authorize hybrid dispatch
+	//           when cfg.Code is populated.
+	//   nonce   MUST be echoed whenever the auth request supplied one,
+	//           regardless of flow.
+	if cfg.AtHash != "" {
 		customClaims["at_hash"] = cfg.AtHash
-		customClaims["c_hash"] = cfg.CodeHash
-	} else {
-		customClaims["nonce"] = cfg.Nonce
-		customClaims["at_hash"] = cfg.Nonce
 	}
+	if cfg.CodeHash != "" {
+		customClaims["c_hash"] = cfg.CodeHash
+	}
+	// OIDC Core §3.1.3.3: the nonce claim MUST echo the value from the
+	// original authorize request. OIDCNonce carries that value when the
+	// token is issued via the token endpoint (code flow). For implicit
+	// flows the caller sets Nonce directly.
+	idTokenNonce := cfg.OIDCNonce
+	if idTokenNonce == "" {
+		idTokenNonce = cfg.Nonce
+	}
+	if idTokenNonce != "" {
+		customClaims["nonce"] = idTokenNonce
+	}
+	// OIDC Core §2: auth_time — Unix seconds. Default to now if caller
+	// did not supply a session-level auth timestamp (backward compat).
+	authTime := cfg.AuthTime
+	if authTime == 0 {
+		authTime = time.Now().Unix()
+	}
+	customClaims["auth_time"] = authTime
+
+	// OIDC Core §2: amr — Authentication Methods Reference array. Omit
+	// the claim for unknown login methods rather than emit an empty array.
+	if amr := loginMethodToAMR(cfg.LoginMethod); len(amr) > 0 {
+		customClaims["amr"] = amr
+	}
+
+	// OIDC Core §2: acr — Authentication Context Class Reference.
+	// Hardcoded "0" (no-op baseline per OIDC Core §2). MFA-aware ACR
+	// alongside acr_values request support is a future enhancement;
+	// for now returning "0" is safer than omitting the claim for
+	// clients that require its presence.
+	customClaims["acr"] = "0"
 	for k, v := range userMap {
 		if k != "roles" {
 			customClaims[k] = v
@@ -416,29 +497,7 @@ func (p *provider) CreateIDToken(cfg *AuthTokenConfig) (string, int64, error) {
 	}
 	// check for the extra access token script
 	if p.config.CustomAccessTokenScript != "" {
-		vm := otto.New()
-		claimBytes, _ := json.Marshal(customClaims)
-		vm.Run(fmt.Sprintf(`
-			var user = %s;
-			var tokenPayload = %s;
-			var customFunction = %s;
-			var functionRes = JSON.stringify(customFunction(user, tokenPayload));
-		`, string(userBytes), string(claimBytes), p.config.CustomAccessTokenScript))
-
-		val, err := vm.Get("functionRes")
-		if err != nil {
-			p.dependencies.Log.Debug().Err(err).Msg("error getting custom access token script")
-		} else {
-			extraPayload := make(map[string]interface{})
-			err = json.Unmarshal([]byte(fmt.Sprintf("%v", val)), &extraPayload)
-			if err != nil {
-				p.dependencies.Log.Debug().Err(err).Msg("error converting accessTokenScript response to map")
-			} else {
-				for k, v := range extraPayload {
-					customClaims[k] = v
-				}
-			}
-		}
+		p.runCustomAccessTokenScript(userBytes, customClaims)
 	}
 
 	token, err := p.SignJWTToken(customClaims)
@@ -466,8 +525,7 @@ func (p *provider) GetIDToken(gc *gin.Context) (string, error) {
 		return "", fmt.Errorf(`not a bearer token`)
 	}
 
-	token := strings.TrimPrefix(auth, "Bearer ")
-	return token, nil
+	return authSplit[1], nil
 }
 
 // SessionOrAccessTokenData is a struct to hold session or access token data
@@ -509,9 +567,75 @@ func (p *provider) GetUserIDFromSessionOrAccessToken(gc *gin.Context) (*SessionO
 		p.dependencies.Log.Debug().Err(err).Msg("Failed to validate access token")
 		return nil, fmt.Errorf(`unauthorized`)
 	}
+	userID, ok := claims["sub"].(string)
+	if !ok || userID == "" {
+		return nil, fmt.Errorf(`unauthorized: missing sub claim`)
+	}
+	loginMethod, _ := claims["login_method"].(string)
+	nonce, _ := claims["nonce"].(string)
 	return &SessionOrAccessTokenData{
-		UserID:      claims["sub"].(string),
-		LoginMethod: claims["login_method"].(string),
-		Nonce:       claims["nonce"].(string),
+		UserID:      userID,
+		LoginMethod: loginMethod,
+		Nonce:       nonce,
 	}, nil
+}
+
+const scriptTimeout = 5 * time.Second
+const scriptTimeoutMsg = "script execution timeout: exceeded 5 seconds"
+
+// runCustomAccessTokenScript executes the custom access token script in an Otto JS VM
+// with a 5-second execution timeout to prevent CPU exhaustion from infinite loops.
+func (p *provider) runCustomAccessTokenScript(userBytes []byte, customClaims jwt.MapClaims) {
+	vm := otto.New()
+	vm.Interrupt = make(chan func(), 1)
+
+	// Start a goroutine that will interrupt the VM after the timeout
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-time.After(scriptTimeout):
+			vm.Interrupt <- func() {
+				panic(scriptTimeoutMsg)
+			}
+		case <-done:
+			// Script finished before timeout; goroutine exits cleanly
+			return
+		}
+	}()
+
+	defer func() {
+		close(done)
+		if caught := recover(); caught != nil {
+			if msg, ok := caught.(string); ok && msg == scriptTimeoutMsg {
+				p.dependencies.Log.Error().Msg("custom access token script timed out after 5 seconds")
+			} else {
+				panic(caught)
+			}
+		}
+	}()
+
+	claimBytes, _ := json.Marshal(customClaims)
+	vm.Run(fmt.Sprintf(`
+		var user = %s;
+		var tokenPayload = %s;
+		var customFunction = %s;
+		var functionRes = JSON.stringify(customFunction(user, tokenPayload));
+	`, string(userBytes), string(claimBytes), p.config.CustomAccessTokenScript))
+
+	val, err := vm.Get("functionRes")
+	if err != nil {
+		p.dependencies.Log.Debug().Err(err).Msg("error getting custom access token script")
+	} else {
+		extraPayload := make(map[string]interface{})
+		err = json.Unmarshal([]byte(fmt.Sprintf("%v", val)), &extraPayload)
+		if err != nil {
+			p.dependencies.Log.Debug().Err(err).Msg("error converting accessTokenScript response to map")
+		} else {
+			for k, v := range extraPayload {
+				if !reservedClaims[k] {
+					customClaims[k] = v
+				}
+			}
+		}
+	}
 }

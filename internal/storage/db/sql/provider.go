@@ -51,7 +51,7 @@ func NewProvider(
 		NamingStrategy: schema.NamingStrategy{
 			TablePrefix: schemas.Prefix,
 		},
-		AllowGlobalUpdate: true,
+		AllowGlobalUpdate: false,
 	}
 
 	dbType := config.DatabaseType
@@ -83,7 +83,7 @@ func NewProvider(
 		}
 	}
 
-	err = sqlDB.AutoMigrate(&schemas.User{}, &schemas.VerificationRequest{}, &schemas.Session{}, &schemas.Env{}, &schemas.Webhook{}, &schemas.WebhookLog{}, &schemas.EmailTemplate{}, &schemas.OTP{}, &schemas.Authenticator{}, &schemas.SessionToken{}, &schemas.MFASession{}, &schemas.OAuthState{})
+	err = sqlDB.AutoMigrate(&schemas.User{}, &schemas.VerificationRequest{}, &schemas.Session{}, &schemas.Env{}, &schemas.Webhook{}, &schemas.WebhookLog{}, &schemas.EmailTemplate{}, &schemas.OTP{}, &schemas.Authenticator{}, &schemas.SessionToken{}, &schemas.MFASession{}, &schemas.OAuthState{}, &schemas.AuditLog{})
 	if err != nil {
 		return nil, err
 	}
@@ -119,4 +119,16 @@ func NewProvider(
 		dependencies: deps,
 		db:           sqlDB,
 	}, nil
+}
+
+// Close closes the underlying SQL connection pool.
+func (p *provider) Close() error {
+	if p.db == nil {
+		return nil
+	}
+	sqlDB, err := p.db.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.Close()
 }

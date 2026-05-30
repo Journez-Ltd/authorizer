@@ -3,6 +3,7 @@ package cookie
 import (
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -10,10 +11,24 @@ import (
 	"github.com/authorizerdev/authorizer/internal/parsers"
 )
 
+// ParseSameSite converts a string ("lax", "strict", "none") to http.SameSite.
+// Defaults to Lax for unrecognized values. The CLI flag --app-cookie-same-site
+// defaults to "none" for backward compatibility with cross-domain SDK setups.
+func ParseSameSite(value string) http.SameSite {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "none":
+		return http.SameSiteNoneMode
+	case "strict":
+		return http.SameSiteStrictMode
+	default:
+		return http.SameSiteLaxMode
+	}
+}
+
 // SetSession sets the session cookie in the response
-func SetSession(gc *gin.Context, sessionID string, appCookieSecure bool) {
+func SetSession(gc *gin.Context, sessionID string, appCookieSecure bool, sameSite http.SameSite) {
 	secure := appCookieSecure
-	httpOnly := appCookieSecure
+	httpOnly := true
 	hostname := parsers.GetHost(gc)
 	host, _ := parsers.GetHostParts(hostname)
 	domain := parsers.GetDomainName(hostname)
@@ -21,28 +36,17 @@ func SetSession(gc *gin.Context, sessionID string, appCookieSecure bool) {
 		domain = "." + domain
 	}
 
-	// Since app cookie can come from cross site it becomes important to set this in lax mode when insecure.
-	// Example person using custom UI on their app domain and making request to authorizer domain.
-	// For more information check:
-	// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Set-Cookie/SameSite
-	// https://github.com/gin-gonic/gin/blob/master/context.go#L86
-	// TODO add ability to configure sameSite (none / lax / strict) via config
-	if !appCookieSecure {
-		gc.SetSameSite(http.SameSiteLaxMode)
-	} else {
-		gc.SetSameSite(http.SameSiteNoneMode)
-	}
-	// TODO allow configuring cookie max-age via config
-	year := 60 * 60 * 24 * 365
+	gc.SetSameSite(sameSite)
+	day := 60 * 60 * 24
 
-	gc.SetCookie(constants.AppCookieName+"_session", sessionID, year, "/", host, secure, httpOnly)
-	gc.SetCookie(constants.AppCookieName+"_session_domain", sessionID, year, "/", domain, secure, httpOnly)
+	gc.SetCookie(constants.AppCookieName+"_session", sessionID, day, "/", host, secure, httpOnly)
+	gc.SetCookie(constants.AppCookieName+"_session_domain", sessionID, day, "/", domain, secure, httpOnly)
 }
 
 // DeleteSession sets session cookies to expire
-func DeleteSession(gc *gin.Context, appCookieSecure bool) {
+func DeleteSession(gc *gin.Context, appCookieSecure bool, sameSite http.SameSite) {
 	secure := appCookieSecure
-	httpOnly := appCookieSecure
+	httpOnly := true
 	hostname := parsers.GetHost(gc)
 	host, _ := parsers.GetHostParts(hostname)
 	domain := parsers.GetDomainName(hostname)
@@ -50,7 +54,7 @@ func DeleteSession(gc *gin.Context, appCookieSecure bool) {
 		domain = "." + domain
 	}
 
-	gc.SetSameSite(http.SameSiteNoneMode)
+	gc.SetSameSite(sameSite)
 	gc.SetCookie(constants.AppCookieName+"_session", "", -1, "/", host, secure, httpOnly)
 	gc.SetCookie(constants.AppCookieName+"_session_domain", "", -1, "/", domain, secure, httpOnly)
 }

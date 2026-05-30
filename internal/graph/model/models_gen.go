@@ -25,6 +25,25 @@ type AdminSignupRequest struct {
 	AdminSecret string `json:"admin_secret"`
 }
 
+type AuditLog struct {
+	ID           string  `json:"id"`
+	ActorID      *string `json:"actor_id,omitempty"`
+	ActorType    *string `json:"actor_type,omitempty"`
+	ActorEmail   *string `json:"actor_email,omitempty"`
+	Action       *string `json:"action,omitempty"`
+	ResourceType *string `json:"resource_type,omitempty"`
+	ResourceID   *string `json:"resource_id,omitempty"`
+	IPAddress    *string `json:"ip_address,omitempty"`
+	UserAgent    *string `json:"user_agent,omitempty"`
+	Metadata     *string `json:"metadata,omitempty"`
+	CreatedAt    *int64  `json:"created_at,omitempty"`
+}
+
+type AuditLogs struct {
+	Pagination *Pagination `json:"pagination"`
+	AuditLogs  []*AuditLog `json:"audit_logs"`
+}
+
 type AuthResponse struct {
 	Message                    string    `json:"message"`
 	ShouldShowEmailOtpScreen   *bool     `json:"should_show_email_otp_screen,omitempty"`
@@ -179,6 +198,16 @@ type InviteMembersResponse struct {
 	Users   []*User `json:"Users"`
 }
 
+type ListAuditLogRequest struct {
+	Pagination    *PaginationRequest `json:"pagination,omitempty"`
+	Action        *string            `json:"action,omitempty"`
+	ActorID       *string            `json:"actor_id,omitempty"`
+	ResourceType  *string            `json:"resource_type,omitempty"`
+	ResourceID    *string            `json:"resource_id,omitempty"`
+	FromTimestamp *int64             `json:"from_timestamp,omitempty"`
+	ToTimestamp   *int64             `json:"to_timestamp,omitempty"`
+}
+
 type ListWebhookLogRequest struct {
 	Pagination *PaginationRequest `json:"pagination,omitempty"`
 	WebhookID  *string            `json:"webhook_id,omitempty"`
@@ -305,6 +334,7 @@ type Response struct {
 type SessionQueryRequest struct {
 	Roles []string `json:"roles,omitempty"`
 	Scope []string `json:"scope,omitempty"`
+	State *string  `json:"state,omitempty"`
 }
 
 type SignUpRequest struct {

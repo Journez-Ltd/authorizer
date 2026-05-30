@@ -1,6 +1,11 @@
 # syntax=docker/dockerfile:1.4
 # Use BuildKit for cache mounts (faster CI: DOCKER_BUILDKIT=1)
-FROM golang:1.25-alpine3.23 AS go-builder
+#
+# Alpine v3.23 main still ships busybox 1.37.0-r30 (e.g. CVE-2025-60876); edge/main has r31+.
+# Pin busybox from edge until the stable branch backports it. See alpine/aports work item #17940.
+FROM golang:1.26-alpine3.23 AS go-builder
+ARG ALPINE_EDGE_MAIN=https://dl-cdn.alpinelinux.org/alpine/edge/main
+RUN apk add --no-cache -X "${ALPINE_EDGE_MAIN}" "busybox>=1.37.0-r31"
 WORKDIR /authorizer
 
 ARG TARGETPLATFORM
@@ -29,10 +34,12 @@ COPY gqlgen.yml ./
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     mkdir -p build/${GOOS}/${GOARCH} && \
-    go build -trimpath -mod=readonly -tags netgo -ldflags "-w -s -X main.VERSION=$VERSION" -o build/${GOOS}/${GOARCH}/authorizer . && \
+    go build -trimpath -mod=readonly -tags netgo -ldflags "-w -s -X github.com/authorizerdev/authorizer/internal/constants.VERSION=$VERSION" -o build/${GOOS}/${GOARCH}/authorizer . && \
     chmod 755 build/${GOOS}/${GOARCH}/authorizer
 
 FROM alpine:3.23.3 AS node-builder
+ARG ALPINE_EDGE_MAIN=https://dl-cdn.alpinelinux.org/alpine/edge/main
+RUN apk add --no-cache -X "${ALPINE_EDGE_MAIN}" "busybox>=1.37.0-r31"
 WORKDIR /authorizer
 COPY web/app/package*.json web/app/
 COPY web/dashboard/package*.json web/dashboard/
@@ -47,6 +54,8 @@ COPY web/dashboard web/dashboard
 RUN cd web/app && npm run build && cd ../dashboard && npm run build
 
 FROM alpine:3.23.3
+ARG ALPINE_EDGE_MAIN=https://dl-cdn.alpinelinux.org/alpine/edge/main
+RUN apk add --no-cache -X "${ALPINE_EDGE_MAIN}" "busybox>=1.37.0-r31"
 
 ARG TARGETARCH=amd64
 
@@ -69,6 +78,18 @@ RUN addgroup -g 1000 authorizer && \
 
 USER authorizer
 
+# Ports (see docs: deployment/docker, deployment/kubernetes)
+# - EXPOSE is documentation only: it does NOT publish ports on the Docker host.
+# - 8080: main HTTP API (OAuth, GraphQL, health on /healthz, etc.). This is what you
+#   typically map with -p 8080:8080 or put behind an Ingress / load balancer.
+# - 8081: dedicated Prometheus /metrics listener. By default the process binds it to
+#   127.0.0.1, so other containers cannot scrape until you pass --metrics-host=0.0.0.0.
+#   Even then: do not map 8081 to the public internet; keep scraping on internal networks
+#   only (Docker internal network, Kubernetes ClusterIP / pod network).
 EXPOSE 8080 8081
+
+# Liveness uses the main HTTP server only (metrics may be loopback-only).
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1
+
 ENTRYPOINT [ "./authorizer" ]
 CMD []

@@ -2,11 +2,15 @@ package graphql
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
+	"github.com/authorizerdev/authorizer/internal/constants"
 	"github.com/authorizerdev/authorizer/internal/cookie"
 	"github.com/authorizerdev/authorizer/internal/crypto"
 	"github.com/authorizerdev/authorizer/internal/graph/model"
+	"github.com/authorizerdev/authorizer/internal/metrics"
 	"github.com/authorizerdev/authorizer/internal/utils"
 )
 
@@ -20,8 +24,17 @@ func (g *graphqlProvider) AdminLogin(ctx context.Context, params *model.AdminLog
 		log.Debug().Err(err).Msg("Failed to get GinContext")
 		return res, fmt.Errorf("internal server error")
 	}
-	if params.AdminSecret != g.Config.AdminSecret {
+	if subtle.ConstantTimeCompare([]byte(params.AdminSecret), []byte(g.Config.AdminSecret)) != 1 {
 		log.Debug().Msg("Invalid admin secret")
+		metrics.RecordAuthEvent(metrics.EventAdminLogin, metrics.StatusFailure)
+		metrics.RecordSecurityEvent("invalid_admin_secret", "admin_login")
+		g.AuditProvider.LogEvent(audit.Event{
+			Action:       constants.AuditAdminLoginFailedEvent,
+			ActorType:    constants.AuditActorTypeAdmin,
+			ResourceType: constants.AuditResourceTypeAdminSession,
+			IPAddress:    utils.GetIP(gc.Request),
+			UserAgent:    utils.GetUserAgent(gc.Request),
+		})
 		return res, fmt.Errorf(`invalid admin secret`)
 	}
 
@@ -31,6 +44,14 @@ func (g *graphqlProvider) AdminLogin(ctx context.Context, params *model.AdminLog
 	}
 	cookie.SetAdminCookie(gc, hashedKey, g.Config.AdminCookieSecure)
 
+	metrics.RecordAuthEvent(metrics.EventAdminLogin, metrics.StatusSuccess)
+	g.AuditProvider.LogEvent(audit.Event{
+		Action:       constants.AuditAdminLoginSuccessEvent,
+		ActorType:    constants.AuditActorTypeAdmin,
+		ResourceType: constants.AuditResourceTypeAdminSession,
+		IPAddress:    utils.GetIP(gc.Request),
+		UserAgent:    utils.GetUserAgent(gc.Request),
+	})
 	res = &model.Response{
 		Message: "admin logged in successfully",
 	}

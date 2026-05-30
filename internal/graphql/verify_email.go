@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
 	"github.com/authorizerdev/authorizer/internal/constants"
 	"github.com/authorizerdev/authorizer/internal/cookie"
 	"github.com/authorizerdev/authorizer/internal/graph/model"
@@ -32,7 +33,7 @@ func (g *graphqlProvider) VerifyEmail(ctx context.Context, params *model.VerifyE
 	verificationRequest, err := g.StorageProvider.GetVerificationRequestByToken(ctx, params.Token)
 	if err != nil {
 		log.Debug().Err(err).Msg("failed GetVerificationRequestByToken")
-		return nil, fmt.Errorf(`invalid token: %s`, err.Error())
+		return nil, fmt.Errorf(`invalid verification token`)
 	}
 
 	// verify if token exists in db
@@ -40,7 +41,7 @@ func (g *graphqlProvider) VerifyEmail(ctx context.Context, params *model.VerifyE
 	claim, err := g.TokenProvider.ParseJWTToken(params.Token)
 	if err != nil {
 		log.Debug().Err(err).Msg("Failed to parse jwt token")
-		return nil, fmt.Errorf(`invalid token: %s`, err.Error())
+		return nil, fmt.Errorf(`invalid verification token`)
 	}
 
 	if ok, err := g.TokenProvider.ValidateJWTClaims(claim, &token.AuthTokenConfig{
@@ -51,7 +52,7 @@ func (g *graphqlProvider) VerifyEmail(ctx context.Context, params *model.VerifyE
 		},
 	}); !ok || err != nil {
 		log.Debug().Err(err).Msg("Failed to validate jwt claims")
-		return nil, fmt.Errorf(`invalid token: %s`, err.Error())
+		return nil, fmt.Errorf(`invalid verification token`)
 	}
 
 	email := claim["sub"].(string)
@@ -207,6 +208,16 @@ func (g *graphqlProvider) VerifyEmail(ctx context.Context, params *model.VerifyE
 			log.Debug().Err(err).Msg("Failed to add session")
 		}
 	}()
+	g.AuditProvider.LogEvent(audit.Event{
+		Action:       constants.AuditEmailVerifiedEvent,
+		ActorID:      user.ID,
+		ActorType:    constants.AuditActorTypeUser,
+		ActorEmail:   refs.StringValue(user.Email),
+		ResourceType: constants.AuditResourceTypeUser,
+		ResourceID:   user.ID,
+		IPAddress:    utils.GetIP(gc.Request),
+		UserAgent:    utils.GetUserAgent(gc.Request),
+	})
 	expiresIn := authToken.AccessToken.ExpiresAt - time.Now().Unix()
 	if expiresIn <= 0 {
 		expiresIn = 1
@@ -221,7 +232,7 @@ func (g *graphqlProvider) VerifyEmail(ctx context.Context, params *model.VerifyE
 	}
 
 	sessionKey := loginMethod + ":" + user.ID
-	cookie.SetSession(gc, authToken.FingerPrintHash, g.Config.AppCookieSecure)
+	cookie.SetSession(gc, authToken.FingerPrintHash, g.Config.AppCookieSecure, cookie.ParseSameSite(g.Config.AppCookieSameSite))
 	g.MemoryStoreProvider.SetUserSession(sessionKey, constants.TokenTypeSessionToken+"_"+authToken.FingerPrint, authToken.FingerPrintHash, authToken.SessionTokenExpiresAt)
 	g.MemoryStoreProvider.SetUserSession(sessionKey, constants.TokenTypeAccessToken+"_"+authToken.FingerPrint, authToken.AccessToken.Token, authToken.AccessToken.ExpiresAt)
 

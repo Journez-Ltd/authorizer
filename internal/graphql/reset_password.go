@@ -6,10 +6,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
 	"github.com/authorizerdev/authorizer/internal/constants"
 	"github.com/authorizerdev/authorizer/internal/cookie"
 	"github.com/authorizerdev/authorizer/internal/crypto"
 	"github.com/authorizerdev/authorizer/internal/graph/model"
+	"github.com/authorizerdev/authorizer/internal/metrics"
 	"github.com/authorizerdev/authorizer/internal/parsers"
 	"github.com/authorizerdev/authorizer/internal/refs"
 	"github.com/authorizerdev/authorizer/internal/storage/schemas"
@@ -90,8 +92,8 @@ func (g *graphqlProvider) ResetPassword(ctx context.Context, params *model.Reset
 	if isOtpVerification {
 		mfaSession, err := cookie.GetMfaSession(gc)
 		if err != nil {
-			log.Debug().Err(err).Msg("Failed to get otp request by email")
-			return nil, fmt.Errorf(`invalid session: %s`, err.Error())
+			log.Debug().Err(err).Msg("Failed to get mfa session cookie")
+			return nil, fmt.Errorf(`invalid session`)
 		}
 		// Get user by phone number
 		user, err = g.StorageProvider.GetUserByPhoneNumber(ctx, phoneNumber)
@@ -101,14 +103,17 @@ func (g *graphqlProvider) ResetPassword(ctx context.Context, params *model.Reset
 		}
 		if _, err := g.MemoryStoreProvider.GetMfaSession(user.ID, mfaSession); err != nil {
 			log.Debug().Err(err).Msg("Failed to get mfa session")
-			return nil, fmt.Errorf(`invalid session: %s`, err.Error())
+			return nil, fmt.Errorf(`invalid session`)
 		}
 		otpRequest, err = g.StorageProvider.GetOTPByPhoneNumber(ctx, phoneNumber)
 		if err != nil {
 			log.Debug().Err(err).Msg("Failed to get otp request by phone number")
 			return nil, fmt.Errorf(`invalid otp`)
 		}
-		if otpRequest.Otp != otp {
+		// OTPs are stored as HMAC-SHA256 digests; we deliberately do NOT
+		// fall back to literal equality so the stored digest cannot be
+		// replayed as a credential by anyone with DB read access.
+		if !crypto.VerifyOTPHash(otp, otpRequest.Otp, g.Config.JWTSecret) {
 			log.Debug().Msg("Failed to verify otp request: Incorrect value")
 			return nil, fmt.Errorf(`invalid otp`)
 		}
@@ -171,6 +176,17 @@ func (g *graphqlProvider) ResetPassword(ctx context.Context, params *model.Reset
 			return nil, err
 		}
 	}
+	g.AuditProvider.LogEvent(audit.Event{
+		Action:       constants.AuditPasswordResetEvent,
+		ActorID:      user.ID,
+		ActorType:    constants.AuditActorTypeUser,
+		ActorEmail:   refs.StringValue(user.Email),
+		ResourceType: constants.AuditResourceTypeUser,
+		ResourceID:   user.ID,
+		IPAddress:    utils.GetIP(gc.Request),
+		UserAgent:    utils.GetUserAgent(gc.Request),
+	})
+	metrics.RecordAuthEvent(metrics.EventResetPwd, metrics.StatusSuccess)
 	return &model.Response{
 		Message: `Password updated successfully.`,
 	}, nil

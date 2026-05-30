@@ -9,11 +9,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
 	"github.com/authorizerdev/authorizer/internal/constants"
 	"github.com/authorizerdev/authorizer/internal/cookie"
 	"github.com/authorizerdev/authorizer/internal/crypto"
 	"github.com/authorizerdev/authorizer/internal/graph/model"
+	"github.com/authorizerdev/authorizer/internal/metrics"
 	"github.com/authorizerdev/authorizer/internal/parsers"
 	"github.com/authorizerdev/authorizer/internal/refs"
 	"github.com/authorizerdev/authorizer/internal/storage/schemas"
@@ -21,6 +24,11 @@ import (
 	"github.com/authorizerdev/authorizer/internal/utils"
 	"github.com/authorizerdev/authorizer/internal/validators"
 )
+
+// dummyHash is a precomputed bcrypt hash used to equalise the response time
+// of the "user exists" path with the "new signup" path, preventing account
+// enumeration via timing.
+var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("dummy-password-for-timing"), bcrypt.DefaultCost)
 
 // SignUp is the method to singup user
 // Permission: none
@@ -81,30 +89,20 @@ func (g *graphqlProvider) SignUp(ctx context.Context, params *model.SignUpReques
 		if err != nil {
 			log.Debug().Err(err).Msg("Failed to get user by email")
 		}
-		if existingUser != nil {
-			if existingUser.EmailVerifiedAt != nil {
-				// email is verified
-				log.Debug().Msg("Email is already verified and signed up.")
-				return nil, fmt.Errorf(`%s has already signed up`, email)
-			} else if existingUser.ID != "" && existingUser.EmailVerifiedAt == nil {
-				log.Debug().Msg("Email is already signed up. Verification pending...")
-				return nil, fmt.Errorf("%s has already signed up. please complete the email verification process or reset the password", email)
-			}
+		if existingUser != nil && (existingUser.EmailVerifiedAt != nil || existingUser.ID != "") {
+			log.Debug().Msg("Email is already signed up.")
+			bcrypt.CompareHashAndPassword(dummyHash, []byte("timing-equalization"))
+			return nil, fmt.Errorf("signup failed. please check your credentials or try a different method")
 		}
 	} else {
 		existingUser, err := g.StorageProvider.GetUserByPhoneNumber(ctx, phoneNumber)
 		if err != nil {
 			log.Debug().Err(err).Msg("Failed to get user by phone number")
 		}
-		if existingUser != nil {
-			if existingUser.PhoneNumberVerifiedAt != nil {
-				// email is verified
-				log.Debug().Msg("Phone number is already verified and signed up.")
-				return nil, fmt.Errorf(`%s has already signed up`, phoneNumber)
-			} else if existingUser.ID != "" && existingUser.PhoneNumberVerifiedAt == nil {
-				log.Debug().Msg("Phone number is already signed up. Verification pending...")
-				return nil, fmt.Errorf("%s has already signed up. please complete the phone number verification process or reset the password", phoneNumber)
-			}
+		if existingUser != nil && (existingUser.PhoneNumberVerifiedAt != nil || existingUser.ID != "") {
+			log.Debug().Msg("Phone number is already signed up.")
+			bcrypt.CompareHashAndPassword(dummyHash, []byte("timing-equalization"))
+			return nil, fmt.Errorf("signup failed. please check your credentials or try a different method")
 		}
 	}
 
@@ -210,7 +208,7 @@ func (g *graphqlProvider) SignUp(ctx context.Context, params *model.SignUpReques
 		redirectURL := parsers.GetAppURL(gc)
 		if params.RedirectURI != nil {
 			redirectURL = *params.RedirectURI
-			if !validators.IsValidOrigin(redirectURL, g.Config.AllowedOrigins) {
+			if !validators.IsValidRedirectURI(redirectURL, g.Config.AllowedOrigins, hostname) {
 				log.Debug().Msg("Invalid redirect URI")
 				return nil, fmt.Errorf("invalid redirect URI")
 			}
@@ -253,14 +251,20 @@ func (g *graphqlProvider) SignUp(ctx context.Context, params *model.SignUpReques
 		}, nil
 	} else if isPhoneVerificationEnabled && isMobileSignup {
 		duration, _ := time.ParseDuration("10m")
-		smsCode := utils.GenerateOTP()
+		smsCode, err := utils.GenerateOTP()
+		if err != nil {
+			log.Debug().Err(err).Msg("Failed to generate OTP")
+			return nil, err
+		}
 		smsBody := strings.Builder{}
 		smsBody.WriteString("Your verification code is: ")
 		smsBody.WriteString(smsCode)
 		expiresAt := time.Now().Add(duration).Unix()
+		// Store the HMAC digest of the OTP; smsCode (plaintext) is sent
+		// over SMS by the existing smsBody above.
 		_, err = g.StorageProvider.UpsertOTP(ctx, &schemas.OTP{
 			PhoneNumber: phoneNumber,
-			Otp:         smsCode,
+			Otp:         crypto.HashOTP(smsCode, g.Config.JWTSecret),
 			ExpiresAt:   expiresAt,
 		})
 		if err != nil {
@@ -284,13 +288,15 @@ func (g *graphqlProvider) SignUp(ctx context.Context, params *model.SignUpReques
 		}, nil
 	}
 	scope := []string{"openid", "email", "profile"}
-	if params.Scope != nil && len(scope) > 0 {
+	if params.Scope != nil && len(params.Scope) > 0 {
 		scope = params.Scope
 	}
 
 	code := ""
 	codeChallenge := ""
 	nonce := ""
+	oidcNonce := ""
+	authorizeRedirectURI := ""
 	if params.State != nil {
 		// Get state from store
 		authorizeState, _ := g.MemoryStoreProvider.GetState(refs.StringValue(params.State))
@@ -299,10 +305,16 @@ func (g *graphqlProvider) SignUp(ctx context.Context, params *model.SignUpReques
 			if len(authorizeStateSplit) > 1 {
 				code = authorizeStateSplit[0]
 				codeChallenge = authorizeStateSplit[1]
+				if len(authorizeStateSplit) > 2 {
+					oidcNonce = authorizeStateSplit[2]
+				}
+				if len(authorizeStateSplit) > 3 {
+					authorizeRedirectURI = authorizeStateSplit[3]
+				}
 			} else {
 				nonce = authorizeState
 			}
-			go g.MemoryStoreProvider.RemoveState(refs.StringValue(params.State))
+			g.MemoryStoreProvider.RemoveState(refs.StringValue(params.State))
 		}
 	}
 
@@ -314,6 +326,7 @@ func (g *graphqlProvider) SignUp(ctx context.Context, params *model.SignUpReques
 		Roles:       roles,
 		Scope:       scope,
 		Nonce:       nonce,
+		OIDCNonce:   oidcNonce,
 		Code:        code,
 		LoginMethod: constants.AuthRecipeMethodBasicAuth,
 		HostName:    hostname,
@@ -325,7 +338,7 @@ func (g *graphqlProvider) SignUp(ctx context.Context, params *model.SignUpReques
 
 	// Code challenge could be optional if PKCE flow is not used
 	if code != "" {
-		if err := g.MemoryStoreProvider.SetState(code, codeChallenge+"@@"+authToken.FingerPrintHash); err != nil {
+		if err := g.MemoryStoreProvider.SetState(code, codeChallenge+"@@"+authToken.FingerPrintHash+"@@"+oidcNonce+"@@"+authorizeRedirectURI); err != nil {
 			log.Debug().Err(err).Msg("SetState failed")
 			return nil, err
 		}
@@ -344,7 +357,7 @@ func (g *graphqlProvider) SignUp(ctx context.Context, params *model.SignUpReques
 	}
 
 	sessionKey := constants.AuthRecipeMethodBasicAuth + ":" + user.ID
-	cookie.SetSession(gc, authToken.FingerPrintHash, g.Config.AppCookieSecure)
+	cookie.SetSession(gc, authToken.FingerPrintHash, g.Config.AppCookieSecure, cookie.ParseSameSite(g.Config.AppCookieSameSite))
 	g.MemoryStoreProvider.SetUserSession(sessionKey, constants.TokenTypeSessionToken+"_"+authToken.FingerPrint, authToken.FingerPrintHash, authToken.SessionTokenExpiresAt)
 	g.MemoryStoreProvider.SetUserSession(sessionKey, constants.TokenTypeAccessToken+"_"+authToken.FingerPrint, authToken.AccessToken.Token, authToken.AccessToken.ExpiresAt)
 
@@ -371,6 +384,18 @@ func (g *graphqlProvider) SignUp(ctx context.Context, params *model.SignUpReques
 			log.Debug().Err(err).Msg("Failed to add session")
 		}
 	}()
+	metrics.RecordAuthEvent(metrics.EventSignup, metrics.StatusSuccess)
+	metrics.ActiveSessions.Inc()
+	g.AuditProvider.LogEvent(audit.Event{
+		Action:       constants.AuditSignupEvent,
+		ActorID:      user.ID,
+		ActorType:    constants.AuditActorTypeUser,
+		ActorEmail:   refs.StringValue(user.Email),
+		ResourceType: constants.AuditResourceTypeUser,
+		ResourceID:   user.ID,
+		IPAddress:    utils.GetIP(gc.Request),
+		UserAgent:    utils.GetUserAgent(gc.Request),
+	})
 
 	return res, nil
 }

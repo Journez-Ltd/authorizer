@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
 	"github.com/authorizerdev/authorizer/internal/constants"
 	"github.com/authorizerdev/authorizer/internal/graph/model"
 	"github.com/authorizerdev/authorizer/internal/parsers"
@@ -38,16 +39,25 @@ func (g *graphqlProvider) ResendVerifyEmail(ctx context.Context, params *model.R
 		return nil, fmt.Errorf("invalid identifier")
 	}
 
+	// Do not reveal whether the account or its pending verification exists.
+	// Return the same generic response in every code path — including the
+	// success path further down — so the user cannot tell from the response
+	// alone whether the email matched a real account. The real reason is
+	// logged at debug level.
+	genericResponse := &model.Response{
+		Message: `If a verification is pending for this email, a new link has been sent. Please check your inbox. If you don't receive it within a few minutes, double-check the email address for typos.`,
+	}
+
 	user, err := g.StorageProvider.GetUserByEmail(ctx, params.Email)
 	if err != nil {
-		log.Debug().Err(err).Msg("Failed to get user by email")
-		return nil, fmt.Errorf("invalid user")
+		log.Debug().Err(err).Str("reason", "user_not_found").Msg("resend verify email silently dropped")
+		return genericResponse, nil
 	}
 
 	verificationRequest, err := g.StorageProvider.GetVerificationRequestByEmail(ctx, params.Email, params.Identifier)
 	if err != nil {
-		log.Debug().Err(err).Msg("Failed to get verification request")
-		return nil, fmt.Errorf(`verification request not found`)
+		log.Debug().Err(err).Str("reason", "verification_request_not_found").Msg("resend verify email silently dropped")
+		return genericResponse, nil
 	}
 
 	// delete current verification and create new one
@@ -90,8 +100,16 @@ func (g *graphqlProvider) ResendVerifyEmail(ctx context.Context, params *model.R
 		"organization":     utils.GetOrganization(g.Config),
 		"verification_url": utils.GetEmailVerificationURL(verificationToken, hostname, verificationRequest.RedirectURI),
 	})
+	g.AuditProvider.LogEvent(audit.Event{
+		Action:       constants.AuditVerifyEmailResentEvent,
+		ActorID:      user.ID,
+		ActorType:    constants.AuditActorTypeUser,
+		ActorEmail:   params.Email,
+		ResourceType: constants.AuditResourceTypeUser,
+		ResourceID:   user.ID,
+		IPAddress:    utils.GetIP(gc.Request),
+		UserAgent:    utils.GetUserAgent(gc.Request),
+	})
 
-	return &model.Response{
-		Message: `Verification email has been sent. Please check your inbox`,
-	}, nil
+	return genericResponse, nil
 }

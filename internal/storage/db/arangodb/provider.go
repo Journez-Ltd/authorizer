@@ -323,9 +323,40 @@ func NewProvider(cfg *config.Config, deps *Dependencies) (*provider, error) {
 		Sparse: true,
 	})
 
+	// AuditLog collection and indexes
+	auditLogCollectionExists, err := arangodb.CollectionExists(ctx, schemas.Collections.AuditLog)
+	if err != nil {
+		return nil, err
+	}
+	if !auditLogCollectionExists {
+		_, err = arangodb.CreateCollection(ctx, schemas.Collections.AuditLog, nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+	auditLogCollection, err := arangodb.Collection(ctx, schemas.Collections.AuditLog)
+	if err != nil {
+		return nil, err
+	}
+	auditLogCollection.EnsureHashIndex(ctx, []string{"actor_id"}, &arangoDriver.EnsureHashIndexOptions{
+		Sparse: true,
+	})
+	auditLogCollection.EnsureHashIndex(ctx, []string{"action"}, &arangoDriver.EnsureHashIndexOptions{
+		Sparse: true,
+	})
+	auditLogCollection.EnsurePersistentIndex(ctx, []string{"timestamp"}, &arangoDriver.EnsurePersistentIndexOptions{
+		Sparse: true,
+	})
+
 	return &provider{
 		config:       cfg,
 		dependencies: deps,
 		db:           arangodb,
 	}, err
+}
+
+// Close releases ArangoDB driver resources. The HTTP driver does not expose a pool close;
+// connections are reclaimed when the provider is discarded.
+func (p *provider) Close() error {
+	return nil
 }

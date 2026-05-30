@@ -178,9 +178,34 @@ func NewProvider(config *config.Config, deps *Dependencies) (*provider, error) {
 		},
 	}, options.CreateIndexes())
 
+	// AuditLog collection and indexes
+	mongodb.CreateCollection(ctx, schemas.Collections.AuditLog, options.CreateCollection())
+	auditLogCollection := mongodb.Collection(schemas.Collections.AuditLog, options.Collection())
+	auditLogCollection.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{
+			Keys:    bson.M{"actor_id": 1},
+			Options: options.Index().SetSparse(true),
+		},
+		{
+			Keys:    bson.M{"action": 1},
+			Options: options.Index().SetSparse(true),
+		},
+		{
+			Keys:    bson.M{"timestamp": -1},
+			Options: options.Index().SetSparse(true),
+		},
+	}, options.CreateIndexes())
+
 	return &provider{
 		config:       config,
 		dependencies: deps,
 		db:           mongodb,
 	}, nil
+}
+
+// Close disconnects the MongoDB client.
+func (p *provider) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return p.db.Client().Disconnect(ctx)
 }

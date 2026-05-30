@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
+	"github.com/authorizerdev/authorizer/internal/constants"
 	"github.com/authorizerdev/authorizer/internal/cookie"
 	"github.com/authorizerdev/authorizer/internal/graph/model"
+	"github.com/authorizerdev/authorizer/internal/metrics"
 	"github.com/authorizerdev/authorizer/internal/utils"
 )
 
@@ -24,6 +27,14 @@ func (g *graphqlProvider) AdminLogout(ctx context.Context) (*model.Response, err
 	}
 
 	cookie.DeleteAdminCookie(gc, g.Config.AdminCookieSecure)
+	metrics.RecordAuthEvent(metrics.EventAdminLogout, metrics.StatusSuccess)
+	g.AuditProvider.LogEvent(audit.Event{
+		Action:       constants.AuditAdminLogoutEvent,
+		ActorType:    constants.AuditActorTypeAdmin,
+		ResourceType: constants.AuditResourceTypeAdminSession,
+		IPAddress:    utils.GetIP(gc.Request),
+		UserAgent:    utils.GetUserAgent(gc.Request),
+	})
 
 	res := &model.Response{
 		Message: "admin logged out successfully",

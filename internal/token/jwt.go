@@ -43,28 +43,42 @@ func (p *provider) SignJWTToken(jwtclaims jwt.MapClaims) (string, error) {
 	}
 }
 
-// ParseJWTToken common util to parse jwt token
-func (p *provider) ParseJWTToken(token string) (jwt.MapClaims, error) {
-	signingMethod := jwt.GetSigningMethod(p.config.JWTType)
+// parseJWTWithKey is a helper shared by primary and secondary key
+// verification. Returns the parsed claims or an error. No exp/iat
+// normalization is performed; the caller handles that exactly once.
+func (p *provider) parseJWTWithKey(token, algo, secret, publicKey string) (jwt.MapClaims, error) {
+	signingMethod := jwt.GetSigningMethod(algo)
+	if signingMethod == nil {
+		return nil, errors.New("unsupported signing method")
+	}
 
 	var claims jwt.MapClaims
 	var err error
 	switch signingMethod {
 	case jwt.SigningMethodHS256, jwt.SigningMethodHS384, jwt.SigningMethodHS512:
-		_, err = jwt.ParseWithClaims(token, &claims, func(token *jwt.Token) (interface{}, error) {
-			return []byte(p.config.JWTSecret), nil
+		_, err = jwt.ParseWithClaims(token, &claims, func(t *jwt.Token) (interface{}, error) {
+			if t.Method.Alg() != signingMethod.Alg() {
+				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+			}
+			return []byte(secret), nil
 		})
 	case jwt.SigningMethodRS256, jwt.SigningMethodRS384, jwt.SigningMethodRS512:
-		_, err = jwt.ParseWithClaims(token, &claims, func(token *jwt.Token) (interface{}, error) {
-			key, err := crypto.ParseRsaPublicKeyFromPemStr(p.config.JWTPublicKey)
+		_, err = jwt.ParseWithClaims(token, &claims, func(t *jwt.Token) (interface{}, error) {
+			if t.Method.Alg() != signingMethod.Alg() {
+				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+			}
+			key, err := crypto.ParseRsaPublicKeyFromPemStr(publicKey)
 			if err != nil {
 				return nil, err
 			}
 			return key, nil
 		})
 	case jwt.SigningMethodES256, jwt.SigningMethodES384, jwt.SigningMethodES512:
-		_, err = jwt.ParseWithClaims(token, &claims, func(token *jwt.Token) (interface{}, error) {
-			key, err := crypto.ParseEcdsaPublicKeyFromPemStr(p.config.JWTPublicKey)
+		_, err = jwt.ParseWithClaims(token, &claims, func(t *jwt.Token) (interface{}, error) {
+			if t.Method.Alg() != signingMethod.Alg() {
+				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+			}
+			key, err := crypto.ParseEcdsaPublicKeyFromPemStr(publicKey)
 			if err != nil {
 				return nil, err
 			}
@@ -72,6 +86,28 @@ func (p *provider) ParseJWTToken(token string) (jwt.MapClaims, error) {
 		})
 	default:
 		err = errors.New("unsupported signing method")
+	}
+	return claims, err
+}
+
+// ParseJWTToken common util to parse jwt token. On signature failure
+// with the primary key, retries with the optional secondary key if one
+// is configured — this supports manual key rotation. The signing key
+// for NEW tokens is always the primary; the secondary is only used for
+// verification so outstanding tokens issued with the previous key keep
+// working during a rotation window.
+func (p *provider) ParseJWTToken(token string) (jwt.MapClaims, error) {
+	claims, err := p.parseJWTWithKey(token, p.config.JWTType, p.config.JWTSecret, p.config.JWTPublicKey)
+	if err != nil && p.config.JWTSecondaryType != "" {
+		// Retry with the secondary key. Any non-nil error from the
+		// primary path triggers the fallback — signature-invalid,
+		// alg-mismatch, or parse error. If the secondary also fails,
+		// return its error (the caller only cares that verification
+		// failed, not which key failed).
+		if secondaryClaims, secondaryErr := p.parseJWTWithKey(token, p.config.JWTSecondaryType, p.config.JWTSecondarySecret, p.config.JWTSecondaryPublicKey); secondaryErr == nil {
+			claims = secondaryClaims
+			err = nil
+		}
 	}
 	if err != nil {
 		return claims, err

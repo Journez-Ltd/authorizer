@@ -10,6 +10,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
 	"github.com/authorizerdev/authorizer/internal/constants"
 	"github.com/authorizerdev/authorizer/internal/cookie"
 	"github.com/authorizerdev/authorizer/internal/crypto"
@@ -202,7 +203,7 @@ func (g *graphqlProvider) UpdateProfile(ctx context.Context, params *model.Updat
 		}
 
 		go g.MemoryStoreProvider.DeleteAllUserSessions(user.ID)
-		go cookie.DeleteSession(gc, g.Config.AppCookieSecure)
+		go cookie.DeleteSession(gc, g.Config.AppCookieSecure, cookie.ParseSameSite(g.Config.AppCookieSameSite))
 
 		user.Email = &newEmail
 		isEmailVerificationEnabled := g.Config.EnableEmailVerification
@@ -256,6 +257,16 @@ func (g *graphqlProvider) UpdateProfile(ctx context.Context, params *model.Updat
 		log.Debug().Err(err).Msg("Failed to update user")
 		return nil, err
 	}
+	g.AuditProvider.LogEvent(audit.Event{
+		Action:       constants.AuditProfileUpdatedEvent,
+		ActorID:      user.ID,
+		ActorType:    constants.AuditActorTypeUser,
+		ActorEmail:   refs.StringValue(user.Email),
+		ResourceType: constants.AuditResourceTypeUser,
+		ResourceID:   user.ID,
+		IPAddress:    utils.GetIP(gc.Request),
+		UserAgent:    utils.GetUserAgent(gc.Request),
+	})
 	message := `Profile details updated successfully.`
 	if hasEmailChanged {
 		message += `For the email change we have sent new verification email, please verify and continue`

@@ -1,10 +1,14 @@
 package http_handlers
 
 import (
+	"crypto/subtle"
 	"net/http"
 	"strings"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
 	"github.com/authorizerdev/authorizer/internal/constants"
+	"github.com/authorizerdev/authorizer/internal/metrics"
+	"github.com/authorizerdev/authorizer/internal/utils"
 	"github.com/gin-gonic/gin"
 )
 
@@ -119,7 +123,8 @@ func (h *httpProvider) RevokeRefreshTokenHandler() gin.HandlerFunc {
 		}
 
 		existingToken, err := h.MemoryStoreProvider.GetUserSession(sessionToken, constants.TokenTypeRefreshToken+"_"+nonce)
-		if err != nil || existingToken == "" || existingToken != tokenValue {
+		// RFC 7009 §2.1: use constant-time comparison to prevent timing attacks
+		if err != nil || existingToken == "" || subtle.ConstantTimeCompare([]byte(existingToken), []byte(tokenValue)) != 1 {
 			// RFC 7009 §2.2: Token not found or mismatch - return 200
 			log.Debug().Msg("Token not found or mismatch, returning 200 per RFC 7009")
 			gc.JSON(http.StatusOK, gin.H{})
@@ -135,6 +140,16 @@ func (h *httpProvider) RevokeRefreshTokenHandler() gin.HandlerFunc {
 			})
 			return
 		}
+		metrics.RecordAuthEvent(metrics.EventTokenRevoke, metrics.StatusSuccess)
+		h.AuditProvider.LogEvent(audit.Event{
+			Action:       constants.AuditTokenRevokedEvent,
+			ActorID:      userID,
+			ActorType:    constants.AuditActorTypeUser,
+			ResourceType: constants.AuditResourceTypeToken,
+			ResourceID:   userID,
+			IPAddress:    utils.GetIP(gc.Request),
+			UserAgent:    utils.GetUserAgent(gc.Request),
+		})
 
 		gc.JSON(http.StatusOK, gin.H{})
 	}

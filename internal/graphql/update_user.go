@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
 	"github.com/authorizerdev/authorizer/internal/constants"
 	"github.com/authorizerdev/authorizer/internal/graph/model"
 	"github.com/authorizerdev/authorizer/internal/parsers"
@@ -84,16 +85,6 @@ func (g *graphqlProvider) UpdateUser(ctx context.Context, params *model.UpdateUs
 	if params.Gender != nil && refs.StringValue(user.Gender) != refs.StringValue(params.Gender) {
 		user.Gender = params.Gender
 	}
-	// TODO
-	// if params.PhoneNumber != nil && refs.StringValue(user.PhoneNumber) != refs.StringValue(params.PhoneNumber) {
-	// 	// verify if phone number is unique
-	// 	if _, err := g.StorageProvider.GetUserByPhoneNumber(ctx, strings.TrimSpace(refs.StringValue(params.PhoneNumber))); err == nil {
-	// 		log.Debug().Msg("user with given phone number already exists")
-	// 		return nil, errors.New("user with given phone number already exists")
-	// 	}
-	// 	user.PhoneNumber = params.PhoneNumber
-	// }
-
 	if params.Picture != nil && refs.StringValue(user.Picture) != refs.StringValue(params.Picture) {
 		user.Picture = params.Picture
 	}
@@ -252,6 +243,14 @@ func (g *graphqlProvider) UpdateUser(ctx context.Context, params *model.UpdateUs
 		log.Debug().Err(err).Msg("failed UpdateUser")
 		return nil, err
 	}
+	g.AuditProvider.LogEvent(audit.Event{
+		Action:       constants.AuditAdminUserUpdatedEvent,
+		ActorType:    constants.AuditActorTypeAdmin,
+		ResourceType: constants.AuditResourceTypeUser,
+		ResourceID:   user.ID,
+		IPAddress:    utils.GetIP(gc.Request),
+		UserAgent:    utils.GetUserAgent(gc.Request),
+	})
 
 	return user.AsAPIUser(), nil
 }

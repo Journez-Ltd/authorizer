@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
+	"github.com/authorizerdev/authorizer/internal/constants"
 	"github.com/authorizerdev/authorizer/internal/graph/model"
 	"github.com/authorizerdev/authorizer/internal/utils"
 )
@@ -42,6 +44,14 @@ func (g *graphqlProvider) DeleteWebhook(ctx context.Context, params *model.Webho
 		return nil, err
 	}
 
+	g.AuditProvider.LogEvent(audit.Event{
+		Action:       constants.AuditAdminWebhookDeletedEvent,
+		ActorType:    constants.AuditActorTypeAdmin,
+		ResourceType: constants.AuditResourceTypeWebhook,
+		ResourceID:   params.ID,
+		IPAddress:    utils.GetIP(gc.Request),
+		UserAgent:    utils.GetUserAgent(gc.Request),
+	})
 	return &model.Response{
 		Message: "Webhook deleted successfully",
 	}, nil

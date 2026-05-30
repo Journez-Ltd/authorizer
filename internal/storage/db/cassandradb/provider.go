@@ -93,11 +93,10 @@ func NewProvider(cfg *config.Config, deps *Dependencies) (*provider, error) {
 
 		cassandraClient.SslOpts = &cansandraDriver.SslOptions{
 			Config: &tls.Config{
-				Certificates:       []tls.Certificate{cert},
-				RootCAs:            caCertPool,
-				InsecureSkipVerify: true,
+				Certificates: []tls.Certificate{cert},
+				RootCAs:      caCertPool,
 			},
-			EnableHostVerification: false,
+			EnableHostVerification: true,
 		}
 	}
 
@@ -107,7 +106,7 @@ func NewProvider(cfg *config.Config, deps *Dependencies) (*provider, error) {
 	cassandraClient.Consistency = cansandraDriver.LocalQuorum
 	cassandraClient.ConnectTimeout = 10 * time.Second
 	cassandraClient.ProtoVersion = 4
-	cassandraClient.Timeout = 30 * time.Minute // for large data
+	cassandraClient.Timeout = 30 * time.Second
 
 	session, err := cassandraClient.CreateSession()
 	if err != nil {
@@ -345,11 +344,42 @@ func NewProvider(cfg *config.Config, deps *Dependencies) (*provider, error) {
 		return nil, err
 	}
 
+	// AuditLog table and indexes
+	auditLogCollectionQuery := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s.%s (id text, actor_id text, actor_type text, actor_email text, action text, resource_type text, resource_id text, ip_address text, user_agent text, metadata text, created_at bigint, PRIMARY KEY (id))", KeySpace, schemas.Collections.AuditLog)
+	err = session.Query(auditLogCollectionQuery).Exec()
+	if err != nil {
+		return nil, err
+	}
+	auditLogActorIdIndex := fmt.Sprintf("CREATE INDEX IF NOT EXISTS authorizer_audit_log_actor_id ON %s.%s (actor_id)", KeySpace, schemas.Collections.AuditLog)
+	err = session.Query(auditLogActorIdIndex).Exec()
+	if err != nil {
+		return nil, err
+	}
+	auditLogActionIndex := fmt.Sprintf("CREATE INDEX IF NOT EXISTS authorizer_audit_log_action ON %s.%s (action)", KeySpace, schemas.Collections.AuditLog)
+	err = session.Query(auditLogActionIndex).Exec()
+	if err != nil {
+		return nil, err
+	}
+	auditLogTimestampIndex := fmt.Sprintf("CREATE INDEX IF NOT EXISTS authorizer_audit_log_created_at ON %s.%s (created_at)", KeySpace, schemas.Collections.AuditLog)
+	err = session.Query(auditLogTimestampIndex).Exec()
+	if err != nil {
+		return nil, err
+	}
+
 	return &provider{
 		config:       cfg,
 		dependencies: deps,
 		db:           session,
 	}, err
+}
+
+// Close closes the Cassandra session.
+func (p *provider) Close() error {
+	if p == nil || p.db == nil {
+		return nil
+	}
+	p.db.Close()
+	return nil
 }
 
 // convertMapValues converts json.Number values in a map to native Go types

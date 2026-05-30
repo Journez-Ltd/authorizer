@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
+	"github.com/authorizerdev/authorizer/internal/constants"
 	"github.com/authorizerdev/authorizer/internal/graph/model"
 	"github.com/authorizerdev/authorizer/internal/refs"
 	"github.com/authorizerdev/authorizer/internal/storage/schemas"
@@ -47,7 +49,7 @@ func (g *graphqlProvider) AddEmailTemplate(ctx context.Context, params *model.Ad
 		design = ""
 	}
 
-	_, err = g.StorageProvider.AddEmailTemplate(ctx, &schemas.EmailTemplate{
+	emailTemplate, err := g.StorageProvider.AddEmailTemplate(ctx, &schemas.EmailTemplate{
 		EventName: params.EventName,
 		Template:  params.Template,
 		Subject:   params.Subject,
@@ -58,6 +60,14 @@ func (g *graphqlProvider) AddEmailTemplate(ctx context.Context, params *model.Ad
 		return nil, err
 	}
 
+	g.AuditProvider.LogEvent(audit.Event{
+		Action:       constants.AuditAdminEmailTemplateCreatedEvent,
+		ActorType:    constants.AuditActorTypeAdmin,
+		ResourceType: constants.AuditResourceTypeEmailTemplate,
+		ResourceID:   emailTemplate.ID,
+		IPAddress:    utils.GetIP(gc.Request),
+		UserAgent:    utils.GetUserAgent(gc.Request),
+	})
 	return &model.Response{
 		Message: `Email template added successfully`,
 	}, nil

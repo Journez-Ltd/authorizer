@@ -18,7 +18,7 @@ import (
 	"github.com/authorizerdev/authorizer/internal/storage/schemas"
 )
 
-// Dependencies struct the data store provider
+// Dependencies carries shared resources for constructing a storage Provider.
 type Dependencies struct {
 	Log *zerolog.Logger
 }
@@ -160,6 +160,20 @@ type Provider interface {
 	DeleteOAuthStateByKey(ctx context.Context, key string) error
 	// GetAllOAuthStates retrieves all OAuth states (for testing)
 	GetAllOAuthStates(ctx context.Context) ([]*schemas.OAuthState, error)
+
+	// Audit Log methods
+	// AddAuditLog adds an audit log entry
+	AddAuditLog(ctx context.Context, log *schemas.AuditLog) error
+	// ListAuditLogs queries audit logs with filters and pagination
+	ListAuditLogs(ctx context.Context, pagination *model.Pagination, filter map[string]interface{}) ([]*schemas.AuditLog, *model.Pagination, error)
+	// DeleteAuditLogsBefore removes logs older than a timestamp (retention)
+	DeleteAuditLogsBefore(ctx context.Context, before int64) error
+
+	// HealthCheck verifies that the storage backend is reachable and responsive.
+	HealthCheck(ctx context.Context) error
+
+	// Close releases resources held by the provider (e.g. database connection pools).
+	Close() error
 }
 
 // New creates a new database provider based on the configuration

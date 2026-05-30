@@ -7,6 +7,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"github.com/authorizerdev/authorizer/internal/audit"
+	"github.com/authorizerdev/authorizer/internal/constants"
+	"github.com/authorizerdev/authorizer/internal/metrics"
+	"github.com/authorizerdev/authorizer/internal/parsers"
+	"github.com/authorizerdev/authorizer/internal/utils"
 	"github.com/authorizerdev/authorizer/internal/validators"
 )
 
@@ -31,7 +36,8 @@ func (h *httpProvider) OAuthLoginHandler() gin.HandlerFunc {
 			return
 		}
 
-		if !validators.IsValidOrigin(redirectURI, h.Config.AllowedOrigins) {
+		hostname := parsers.GetHost(c)
+		if !validators.IsValidRedirectURI(redirectURI, h.Config.AllowedOrigins, hostname) {
 			log.Debug().Msg("Invalid redirect URI")
 			c.JSON(400, gin.H{
 				"error": "invalid redirect uri",
@@ -91,6 +97,15 @@ func (h *httpProvider) OAuthLoginHandler() gin.HandlerFunc {
 		}
 		url := cfg.AuthCodeURL(oauthStateString)
 		log.Debug().Str("url", url).Msg("redirecting to oauth provider")
+		metrics.RecordAuthEvent(metrics.EventOAuthLogin, metrics.StatusSuccess)
+		h.AuditProvider.LogEvent(audit.Event{
+			Action:       constants.AuditOAuthLoginInitiatedEvent,
+			ActorType:    constants.AuditActorTypeUser,
+			ResourceType: constants.AuditResourceTypeSession,
+			Metadata:     provider,
+			IPAddress:    utils.GetIP(c.Request),
+			UserAgent:    utils.GetUserAgent(c.Request),
+		})
 		c.Redirect(http.StatusTemporaryRedirect, url)
 	}
 }
