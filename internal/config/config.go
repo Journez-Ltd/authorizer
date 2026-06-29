@@ -187,8 +187,11 @@ type Config struct {
 	JWTSecondaryPrivateKey string
 	// JWTRoleClaim is the role claim for the JWT
 	JWTRoleClaim string
-	// RefreshTokenExpiresIn is the refresh token lifetime in seconds.
+	// AccessTokenExpiresIn is the access token lifetime in seconds.
 	// Defaults to 30 days (2592000 seconds) when zero or unset.
+	AccessTokenExpiresIn int64
+	// RefreshTokenExpiresIn is the refresh token lifetime in seconds.
+	// Defaults to 90 days (7776000 seconds) when zero or unset.
 	RefreshTokenExpiresIn int64
 	// CustomAccessTokenScript is the custom access token script
 	CustomAccessTokenScript string

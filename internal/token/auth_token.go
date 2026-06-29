@@ -189,13 +189,28 @@ func (p *provider) CreateSessionToken(cfg *AuthTokenConfig) (*SessionData, strin
 	return fingerPrintMap, fingerPrintHash, expiresAt, nil
 }
 
+// resolveAccessTokenExpiry returns the access/id token lifetime from cfg.ExpireTime,
+// --access-token-expires-in, or a 30-minute dev fallback when both are unset.
+func (p *provider) resolveAccessTokenExpiry(cfg *AuthTokenConfig) time.Duration {
+	if cfg != nil && cfg.ExpireTime != "" {
+		if expiryBound, err := utils.ParseDurationInSeconds(cfg.ExpireTime); err == nil {
+			return expiryBound
+		}
+	}
+	expirySeconds := p.config.AccessTokenExpiresIn
+	if expirySeconds <= 0 {
+		return time.Minute * 30
+	}
+	return time.Duration(expirySeconds) * time.Second
+}
+
 // CreateRefreshToken util to create JWT token
 func (p *provider) CreateRefreshToken(cfg *AuthTokenConfig) (string, int64, error) {
 	// Lifetime is configurable via --refresh-token-expires-in (seconds).
-	// Default 30 days when unset or non-positive.
+	// Default 90 days when unset or non-positive.
 	expirySeconds := p.config.RefreshTokenExpiresIn
 	if expirySeconds <= 0 {
-		expirySeconds = 60 * 60 * 24 * 30
+		expirySeconds = 60 * 60 * 24 * 90
 	}
 	expiryBound := time.Duration(expirySeconds) * time.Second
 	expiresAt := time.Now().Add(expiryBound).Unix()
@@ -224,10 +239,7 @@ func (p *provider) CreateRefreshToken(cfg *AuthTokenConfig) (string, int64, erro
 // CreateAccessToken util to create JWT token, based on
 // user information, roles config and CUSTOM_ACCESS_TOKEN_SCRIPT
 func (p *provider) CreateAccessToken(cfg *AuthTokenConfig) (string, int64, error) {
-	expiryBound, err := utils.ParseDurationInSeconds(cfg.ExpireTime)
-	if err != nil {
-		expiryBound = time.Minute * 30
-	}
+	expiryBound := p.resolveAccessTokenExpiry(cfg)
 	expiresAt := time.Now().Add(expiryBound).Unix()
 	customClaims := jwt.MapClaims{
 		"iss":           cfg.HostName,
@@ -423,10 +435,7 @@ func (p *provider) ValidateBrowserSession(gc *gin.Context, encryptedSession stri
 // See the in-function block comment for the at_hash / c_hash / nonce
 // emission rules per OIDC Core §3.1.3.6 / §3.2.2.10.
 func (p *provider) CreateIDToken(cfg *AuthTokenConfig) (string, int64, error) {
-	expiryBound, err := utils.ParseDurationInSeconds(cfg.ExpireTime)
-	if err != nil {
-		expiryBound = time.Minute * 30
-	}
+	expiryBound := p.resolveAccessTokenExpiry(cfg)
 	expiresAt := time.Now().Add(expiryBound).Unix()
 	resUser := cfg.User.AsAPIUser()
 	userBytes, _ := json.Marshal(&resUser)

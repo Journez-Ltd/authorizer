@@ -112,7 +112,8 @@ func init() {
 
 	// Admin flags
 	f.StringVar(&rootArgs.config.AdminSecret, "admin-secret", "", "Secret for the admin (REQUIRED, must not be empty)")
-	f.Int64Var(&rootArgs.config.RefreshTokenExpiresIn, "refresh-token-expires-in", 60*60*24*30, "Refresh token lifetime in seconds (default: 30 days = 2592000)")
+	f.Int64Var(&rootArgs.config.AccessTokenExpiresIn, "access-token-expires-in", 60*60*24*30, "Access token lifetime in seconds (default: 30 days = 2592000)")
+	f.Int64Var(&rootArgs.config.RefreshTokenExpiresIn, "refresh-token-expires-in", 60*60*24*90, "Refresh token lifetime in seconds (default: 90 days = 7776000)")
 
 	// Allowed origins
 	f.StringSliceVar(&rootArgs.config.AllowedOrigins, "allowed-origins", defaultAllowedOrigins, "Allowed origins")
