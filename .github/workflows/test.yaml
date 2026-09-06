@@ -1,0 +1,45 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        with:
+          go-version: "1.26.x"
+      - name: Test (sqlite backend -- no external DB service needed)
+        run: make test
+
+  vulncheck:
+    name: Dependency vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        with:
+          go-version: "1.26.x"
+      - name: govulncheck
+        # ADR 0007 (hard fork): this repo no longer receives upstream
+        # security patches from authorizerdev/authorizer, so tracking CVEs
+        # in Go and its dependencies became this team's own job. This is
+        # the earliest possible signal -- runs on every PR, not just at
+        # release, unlike the image-level Trivy scan in release.yaml.
+        #
+        # continue-on-error: the first run of this scan already found 12
+        # real, pre-existing vulnerabilities (stdlib crypto/x509 and net/http
+        # patch levels, golang.org/x/net/idna, jackc/pgx/v5) that predate
+        # this workflow and need their own remediation effort -- turning
+        # this into a hard gate today would block every future PR on
+        # unrelated debt. Remove continue-on-error once those are cleared.
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        continue-on-error: true

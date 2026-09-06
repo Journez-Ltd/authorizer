@@ -18,46 +18,48 @@ on:
     types: [created]
 
 env:
-  DOCKER_IMAGE: lakhansamani/authorizer
+  DOCKER_IMAGE: journez/authorizer
   BUILDKIT_INLINE_CACHE: 1
 
 jobs:
   build:
-    name: Build and push Docker image
+    name: Build Docker image
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-        with:
-          platforms: linux/amd64,linux/arm64
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-      - name: Build and push
+      # No registry push: Journez doesn't run one (services/*/README and
+      # plans/.../phase-5-container-cicd.md -- images are built locally or
+      # in CI and transferred straight to the VPS, no Docker Hub, no GHCR
+      # yet). This workflow inherited a push to lakhansamani/authorizer --
+      # the upstream maintainer's own Docker Hub namespace -- and never got
+      # updated after the fork; DOCKER_USERNAME/DOCKER_PASSWORD were never
+      # configured in this org's repo either (0 secrets set, confirmed via
+      # the GitHub API), so it would have failed at the login step had it
+      # ever actually run. Building (not pushing) here just verifies the
+      # image is buildable and gives trivy-scan something to scan.
+      - name: Build (local only, single platform)
         env:
           SOURCE_URL: https://github.com/${{ github.repository }}
         run: |
-          VERSION=$(basename ${GITHUB_REF})
-          TAG_ARGS=(-t "${DOCKER_IMAGE}:${VERSION}")
-          if [[ "$VERSION" != *"rc"* && "$VERSION" != *"beta"* ]]; then
-            TAG_ARGS+=(-t "${DOCKER_IMAGE}:latest")
-          fi
+          VERSION=$(basename "${GITHUB_REF}")
           docker buildx build \
-            --platform linux/amd64,linux/arm64 \
-            --push \
-            --provenance=true \
-            --sbom=true \
+            --platform linux/amd64 \
+            --load \
             --build-arg VERSION="${VERSION}" \
             --build-arg BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
             --build-arg VCS_REF="${GITHUB_SHA}" \
             --build-arg SOURCE_URL="${SOURCE_URL}" \
-            --cache-from type=registry,ref=${DOCKER_IMAGE}:buildcache \
-            --cache-to type=registry,ref=${DOCKER_IMAGE}:buildcache,mode=max \
-            "${TAG_ARGS[@]}" \
+            -t "${DOCKER_IMAGE}:${GITHUB_SHA}" \
             .
+      - name: Save image for the scan job
+        run: docker save "${DOCKER_IMAGE}:${GITHUB_SHA}" -o /tmp/authorizer-image.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: authorizer-image
+          path: /tmp/authorizer-image.tar
+          retention-days: 1
 
   trivy-scan:
     name: Vulnerability scan (Trivy)
@@ -67,10 +69,16 @@ jobs:
       contents: read
       security-events: write
     steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: authorizer-image
+          path: /tmp
+      - name: Load image
+        run: docker load -i /tmp/authorizer-image.tar
       - name: Run Trivy
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ env.DOCKER_IMAGE }}:${{ github.ref_name }}
+          image-ref: "journez/authorizer:${{ github.sha }}"
           format: "sarif"
           output: "trivy-results.sarif"
           severity: "CRITICAL,HIGH"
